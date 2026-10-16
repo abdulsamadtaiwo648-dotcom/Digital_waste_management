@@ -1,0 +1,1 @@
+import{c as e,i as t,l as n,o as r,s as i,t as a}from"./staff-AYNVBJTe.js";/* empty css                 */var o=n(e(),1),s=n(i(),1),c=t();s.createRoot(document.getElementById(`root`)).render((0,c.jsx)(o.StrictMode,{children:(0,c.jsx)(r,{children:(0,c.jsx)(a,{})})}));

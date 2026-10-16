@@ -1,0 +1,7 @@
+.env
+.local/
+.venv/
+__pycache__/
+*.py[cod]
+bin/
+coverage.out

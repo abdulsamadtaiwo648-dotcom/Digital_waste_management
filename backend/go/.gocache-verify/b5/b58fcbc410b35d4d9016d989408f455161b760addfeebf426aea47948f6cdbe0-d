@@ -1,0 +1,17 @@
+./admin.go
+./areas.go
+./auth.go
+./bootstrap.go
+./complaints.go
+./locations.go
+./main.go
+./operations.go
+./password_reset.go
+./payments.go
+./rate_limit.go
+./areas_integration_test.go
+./audit_integration_test.go
+./auth_integration_test.go
+./auth_test.go
+./iot_input_test.go
+./iot_integration_test.go

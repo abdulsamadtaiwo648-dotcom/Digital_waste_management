@@ -1,0 +1,11 @@
+./admin.go
+./areas.go
+./auth.go
+./bootstrap.go
+./complaints.go
+./locations.go
+./main.go
+./operations.go
+./password_reset.go
+./payments.go
+./rate_limit.go
