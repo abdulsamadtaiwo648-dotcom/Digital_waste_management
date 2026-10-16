@@ -1,6 +1,8 @@
 .env
 .local/
 .venv/
+frontend/node_modules/
+frontend/dist/
 __pycache__/
 *.py[cod]
 bin/
