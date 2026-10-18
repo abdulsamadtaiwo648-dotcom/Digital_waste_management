@@ -7,3 +7,5 @@ __pycache__/
 *.py[cod]
 bin/
 coverage.out
+/backend/go.exe
+/backend/go/package-lock.json

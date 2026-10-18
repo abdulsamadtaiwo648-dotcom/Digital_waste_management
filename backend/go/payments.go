@@ -32,7 +32,7 @@ func (s *server) paymentOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	current := r.Context().Value(userContextKey).(user)
-	area, amount, err := s.feeForLocation(r.Context(), s.db, current.ID, id, false)
+	area, amount, breakdown, err := s.feeForLocation(r.Context(), s.db, current.ID, id, false)
 	if errors.Is(err, errLocationNotFound) {
 		writeError(w, 404, "location_not_found", "Saved service address was not found")
 		return
@@ -46,6 +46,15 @@ func (s *server) paymentOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil && !errors.Is(err, errAreaFeeUnconfigured) {
+		if errors.Is(err, errBinFeeUnconfigured) {
+			areaName := area.Locality + ", " + area.City + ", " + area.State
+			writeJSON(w, 200, map[string]any{"enabled": false, "simulated": s.paymentSimulation, "fee_amount_kobo": 0, "fee_breakdown": breakdown, "area_id": area.ID, "area_name": areaName, "message": "A fee has not been configured for every delivered bin size at this address. Contact service management before paying."})
+			return
+		}
+		if errors.Is(err, errBinPayerUnassigned) {
+			writeJSON(w, 200, map[string]any{"enabled": false, "simulated": s.paymentSimulation, "fee_amount_kobo": 0, "fee_breakdown": breakdown, "area_id": area.ID, "message": "A delivered bin is not linked to an active unit billing contact. Contact service management before paying."})
+			return
+		}
 		writeError(w, 500, "payment_options_unavailable", "The area fee could not be loaded")
 		return
 	}
@@ -54,7 +63,7 @@ func (s *server) paymentOptions(w http.ResponseWriter, r *http.Request) {
 	if errors.Is(err, errAreaFeeUnconfigured) {
 		message = "A waste fee has not been configured for this service area."
 	}
-	writeJSON(w, 200, map[string]any{"enabled": s.paymentSimulation && amount > 0 && err == nil, "simulated": s.paymentSimulation, "fee_amount_kobo": amount, "area_id": area.ID, "area_name": areaName, "message": message})
+	writeJSON(w, 200, map[string]any{"enabled": s.paymentSimulation && amount > 0 && err == nil, "simulated": s.paymentSimulation, "fee_amount_kobo": amount, "fee_breakdown": breakdown, "area_id": area.ID, "area_name": areaName, "message": message})
 }
 
 func paymentOptionMessage(simulated bool, amount int64) string {
@@ -94,7 +103,23 @@ func (s *server) createPayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	_, amount, err := s.feeForLocation(r.Context(), tx, current.ID, input.LocationID, true)
+	var existing payment
+	var existingLocationID int64
+	err = tx.QueryRow(r.Context(), `SELECT reference,COALESCE(location_id,0),service_code,amount_kobo,status,mode,created_at::text FROM payments WHERE citizen_id=$1 AND idempotency_key=$2`, current.ID, key).Scan(&existing.Reference, &existingLocationID, &existing.ServiceCode, &existing.AmountKobo, &existing.Status, &existing.Mode, &existing.CreatedAt)
+	if err == nil {
+		if existingLocationID != input.LocationID {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", "This idempotency key was already used for a different saved address")
+			return
+		}
+		existing.LocationID = &existingLocationID
+		writeJSON(w, 200, map[string]any{"payment": existing, "simulated": true})
+		return
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, 500, "payment_initialization_failed", "Existing payment could not be checked")
+		return
+	}
+	_, amount, breakdown, err := s.feeForLocation(r.Context(), tx, current.ID, input.LocationID, true)
 	if errors.Is(err, errLocationNotFound) {
 		writeError(w, 404, "location_not_found", "Saved service address was not found")
 		return
@@ -105,6 +130,14 @@ func (s *server) createPayment(w http.ResponseWriter, r *http.Request) {
 	}
 	if errors.Is(err, errServiceAreaInactive) {
 		writeError(w, 409, "service_area_unavailable", "This address is assigned to an inactive service area. No payment was initialized.")
+		return
+	}
+	if errors.Is(err, errBinFeeUnconfigured) {
+		writeError(w, http.StatusServiceUnavailable, "bin_fee_unconfigured", "A fee has not been configured for every delivered bin size. No payment was attempted.")
+		return
+	}
+	if errors.Is(err, errBinPayerUnassigned) {
+		writeError(w, http.StatusServiceUnavailable, "bin_payer_unassigned", "A delivered bin is not linked to an active unit billing contact. No payment was attempted.")
 		return
 	}
 	if err != nil || amount <= 0 {
@@ -120,11 +153,17 @@ func (s *server) createPayment(w http.ResponseWriter, r *http.Request) {
 	created.LocationID = &input.LocationID
 	err = tx.QueryRow(r.Context(), `INSERT INTO payments(reference,citizen_id,location_id,service_code,amount_kobo,status,mode,idempotency_key) VALUES($1,$2,$3,'waste_fee',$4,'pending','simulation',$5) ON CONFLICT(citizen_id,idempotency_key) DO NOTHING RETURNING reference,service_code,amount_kobo,status,mode,created_at::text`, reference, current.ID, input.LocationID, amount, key).Scan(&created.Reference, &created.ServiceCode, &created.AmountKobo, &created.Status, &created.Mode, &created.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
-		err = tx.QueryRow(r.Context(), `SELECT reference,service_code,amount_kobo,status,mode,created_at::text FROM payments WHERE citizen_id=$1 AND idempotency_key=$2`, current.ID, key).Scan(&created.Reference, &created.ServiceCode, &created.AmountKobo, &created.Status, &created.Mode, &created.CreatedAt)
+		var existingLocationID int64
+		err = tx.QueryRow(r.Context(), `SELECT reference,COALESCE(location_id,0),service_code,amount_kobo,status,mode,created_at::text FROM payments WHERE citizen_id=$1 AND idempotency_key=$2`, current.ID, key).Scan(&created.Reference, &existingLocationID, &created.ServiceCode, &created.AmountKobo, &created.Status, &created.Mode, &created.CreatedAt)
 		if err != nil {
 			writeError(w, 500, "payment_initialization_failed", "Payment could not be loaded")
 			return
 		}
+		if existingLocationID != input.LocationID {
+			writeError(w, http.StatusConflict, "idempotency_key_conflict", "This idempotency key was already used for a different saved address")
+			return
+		}
+		created.LocationID = &existingLocationID
 		writeJSON(w, 200, map[string]any{"payment": created, "simulated": true})
 		return
 	}
@@ -140,7 +179,7 @@ func (s *server) createPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "payment_initialization_failed", "Payment could not be initialized")
 		return
 	}
-	writeJSON(w, 201, map[string]any{"payment": created, "simulated": true})
+	writeJSON(w, 201, map[string]any{"payment": created, "fee_breakdown": breakdown, "simulated": true})
 }
 
 func (s *server) listPayments(w http.ResponseWriter, r *http.Request) {

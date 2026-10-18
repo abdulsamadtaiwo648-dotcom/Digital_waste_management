@@ -136,7 +136,16 @@ func (s *server) updateComplaintStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) listContainers(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.db.Query(r.Context(), `SELECT c.id,c.label,c.service_area,c.usable_depth_cm,c.minimum_distance_cm,c.installation_offset_cm,
-		r.fill_percent,r.level,r.measured_at::text FROM containers c LEFT JOIN LATERAL (SELECT fill_percent,level,measured_at FROM sensor_readings WHERE device_id IN (SELECT id FROM devices WHERE container_id=c.id) ORDER BY measured_at DESC LIMIT 1) r ON true ORDER BY c.label`)
+		r.fill_percent,r.level,r.measured_at::text,(SELECT count(*)::int FROM devices d WHERE d.container_id=c.id AND d.enabled) FROM containers c LEFT JOIN LATERAL (
+			SELECT fill_percent,level,measured_at FROM (
+				SELECT DISTINCT ON (sr.device_id) sr.fill_percent,sr.level,sr.measured_at
+				FROM sensor_readings sr JOIN devices d ON d.id=sr.device_id
+				WHERE d.container_id=c.id AND d.enabled
+					AND sr.measured_at > now()-make_interval(mins=>COALESCE((SELECT (value::text)::int FROM application_settings WHERE key='offline_after_minutes'),180))
+				ORDER BY sr.device_id,sr.measured_at DESC,sr.id DESC
+			) latest_per_sensor
+			ORDER BY fill_percent DESC,measured_at DESC LIMIT 1
+		) r ON true ORDER BY c.label`)
 	if err != nil {
 		writeError(w, 500, "containers_unavailable", "Containers could not be loaded")
 		return
@@ -148,11 +157,12 @@ func (s *server) listContainers(w http.ResponseWriter, r *http.Request) {
 		var depth, minDistance, offset float64
 		var fill *float64
 		var level, measuredAt *string
-		if err := rows.Scan(&id, &label, &area, &depth, &minDistance, &offset, &fill, &level, &measuredAt); err != nil {
+		var sensorCount int
+		if err := rows.Scan(&id, &label, &area, &depth, &minDistance, &offset, &fill, &level, &measuredAt, &sensorCount); err != nil {
 			writeError(w, 500, "containers_unavailable", "Containers could not be loaded")
 			return
 		}
-		items = append(items, map[string]any{"id": id, "label": label, "service_area": area, "usable_depth_cm": depth, "minimum_distance_cm": minDistance, "installation_offset_cm": offset, "latest_fill_percent": fill, "latest_level": level, "last_reading_at": measuredAt})
+		items = append(items, map[string]any{"id": id, "label": label, "service_area": area, "usable_depth_cm": depth, "minimum_distance_cm": minDistance, "installation_offset_cm": offset, "active_sensor_count": sensorCount, "latest_fill_percent": fill, "latest_level": level, "last_reading_at": measuredAt})
 	}
 	if rows.Err() != nil {
 		writeError(w, 500, "containers_unavailable", "Containers could not be loaded")

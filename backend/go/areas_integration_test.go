@@ -254,12 +254,16 @@ func managedAreaTestDatabase(t *testing.T, dsn string) (*pgxpool.Pool, func()) {
 
 func applyManagedAreaMigration(t *testing.T, pool *pgxpool.Pool) error {
 	t.Helper()
-	contents, err := os.ReadFile(filepath.Join("..", "..", "db", "migrations", "008_managed_service_areas.sql"))
-	if err != nil {
-		return err
+	for _, migration := range []string{"008_managed_service_areas.sql", "009_property_unit_registration.sql", "010_property_lifecycle_and_reviews.sql", "011_property_application_review.sql", "012_property_unit_case_insensitive_uniqueness.sql"} {
+		contents, err := os.ReadFile(filepath.Join("..", "..", "db", "migrations", migration))
+		if err != nil {
+			return err
+		}
+		if _, err = pool.Exec(context.Background(), string(contents)); err != nil {
+			return fmt.Errorf("apply %s: %w", migration, err)
+		}
 	}
-	_, err = pool.Exec(context.Background(), string(contents))
-	return err
+	return nil
 }
 
 func insertLegacyLocation(t *testing.T, pool *pgxpool.Pool, residentID int64, locality, city, state string) int64 {

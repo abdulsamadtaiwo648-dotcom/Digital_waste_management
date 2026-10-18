@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -30,6 +31,7 @@ type server struct {
 	authLimiter       *authLimiter
 	devResetLinks     bool
 	paymentSimulation bool
+	development       bool
 }
 
 type readingRequest struct {
@@ -96,7 +98,7 @@ func main() {
 	if serviceRole == "admin" {
 		staffCookie = "dwmp_admin_session"
 	}
-	s := &server{db: db, processorURL: processorURL, processorClient: &http.Client{Timeout: 3 * time.Second}, sessionSecret: []byte(sessionSecret), serviceRole: serviceRole, serviceOrigin: envOr("SERVICE_ORIGIN", envOr("FRONTEND_ORIGIN", "http://localhost:5173")), staffCookie: staffCookie, cookieSecure: os.Getenv("COOKIE_SECURE") == "true" || production, authLimiter: newAuthLimiter(), devResetLinks: !production && os.Getenv("DEV_RESET_LINKS") == "true", paymentSimulation: !production && os.Getenv("PAYMENT_MODE") == "simulation"}
+	s := &server{db: db, processorURL: processorURL, processorClient: &http.Client{Timeout: 3 * time.Second}, sessionSecret: []byte(sessionSecret), serviceRole: serviceRole, serviceOrigin: envOr("SERVICE_ORIGIN", envOr("FRONTEND_ORIGIN", "http://localhost:5173")), staffCookie: staffCookie, cookieSecure: os.Getenv("COOKIE_SECURE") == "true" || production, authLimiter: newAuthLimiter(), devResetLinks: !production && os.Getenv("DEV_RESET_LINKS") == "true", paymentSimulation: !production && os.Getenv("PAYMENT_MODE") == "simulation", development: !production}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /service-info", s.serviceInfo)
@@ -116,6 +118,10 @@ func main() {
 	mux.Handle("POST /api/v1/locations", s.requireUser(http.HandlerFunc(s.createLocation)))
 	mux.Handle("PATCH /api/v1/locations/{id}", s.requireUser(http.HandlerFunc(s.updateLocation)))
 	mux.Handle("DELETE /api/v1/locations/{id}", s.requireUser(http.HandlerFunc(s.deleteLocation)))
+	mux.Handle("GET /api/v1/properties", s.requireUser(http.HandlerFunc(s.listProperties)))
+	mux.Handle("POST /api/v1/properties", s.requireUser(http.HandlerFunc(s.registerProperty)))
+	mux.Handle("POST /api/v1/properties/unit-requests", s.requireUser(http.HandlerFunc(s.requestPropertyUnit)))
+	mux.Handle("GET /api/v1/properties/unit-requests", s.requireUser(http.HandlerFunc(s.residentPropertyUnitRequests)))
 	mux.Handle("GET /api/v1/payments/options", s.requireUser(http.HandlerFunc(s.paymentOptions)))
 	mux.Handle("GET /api/v1/payments", s.requireUser(http.HandlerFunc(s.listPayments)))
 	mux.Handle("POST /api/v1/payments", s.requireUser(s.limitAuth(http.HandlerFunc(s.createPayment))))
@@ -130,6 +136,15 @@ func main() {
 	mux.Handle("GET /api/v1/operations/payments", s.requireRole("operations_manager", http.HandlerFunc(s.operationsPayments)))
 	mux.Handle("PATCH /api/v1/operations/complaints/{reference}", s.requireRole("operations_manager", http.HandlerFunc(s.updateComplaintStatus)))
 	mux.Handle("GET /api/v1/operations/containers", s.requireRole("operations_manager", http.HandlerFunc(s.listContainers)))
+	mux.Handle("GET /api/v1/operations/properties", s.requireRole("operations_manager", http.HandlerFunc(s.operationsProperties)))
+	mux.Handle("PATCH /api/v1/operations/properties/{id}/review", s.requireRole("operations_manager", http.HandlerFunc(s.reviewPropertyRegistration)))
+	mux.Handle("GET /api/v1/operations/service-areas", s.requireRole("operations_manager", http.HandlerFunc(s.listOperationsServiceAreas)))
+	mux.Handle("POST /api/v1/operations/assisted-properties", s.requireRole("operations_manager", http.HandlerFunc(s.assistedPropertyRegistration)))
+	mux.Handle("GET /api/v1/operations/property-unit-requests", s.requireRole("operations_manager", http.HandlerFunc(s.operationsPropertyUnitRequests)))
+	mux.Handle("PATCH /api/v1/operations/property-unit-requests/{id}", s.requireRole("operations_manager", http.HandlerFunc(s.reviewPropertyUnitRequest)))
+	mux.Handle("POST /api/v1/operations/properties/{id}/bins", s.requireRole("operations_manager", http.HandlerFunc(s.createPropertyBin)))
+	mux.Handle("PATCH /api/v1/operations/bins/{id}/delivery", s.requireRole("operations_manager", http.HandlerFunc(s.recordBinDelivery)))
+	mux.Handle("POST /api/v1/operations/bin-evacuations", s.requireRole("operations_manager", http.HandlerFunc(s.recordBinEvacuation)))
 	mux.Handle("POST /api/v1/operations/containers", s.requireRole("operations_manager", http.HandlerFunc(s.createContainer)))
 	mux.Handle("GET /api/v1/operations/collections", s.requireRole("operations_manager", http.HandlerFunc(s.listCollections)))
 	mux.Handle("POST /api/v1/operations/collections", s.requireRole("operations_manager", http.HandlerFunc(s.createCollection)))
@@ -148,11 +163,19 @@ func main() {
 	mux.Handle("GET /api/v1/admin/containers", s.requireRole("system_administrator", http.HandlerFunc(s.listContainers)))
 	mux.Handle("POST /api/v1/admin/devices", s.requireRole("system_administrator", http.HandlerFunc(s.createDevice)))
 	mux.Handle("PATCH /api/v1/admin/devices/{id}", s.requireRole("system_administrator", http.HandlerFunc(s.updateDevice)))
+	mux.Handle("GET /api/v1/admin/devices/{id}/readings", s.requireRole("system_administrator", http.HandlerFunc(s.adminDeviceReadings)))
+	mux.Handle("GET /api/v1/operations/containers/{id}/readings", s.requireRole("operations_manager", http.HandlerFunc(s.containerReadings)))
+	if !production {
+		mux.Handle("POST /api/v1/admin/devices/{id}/simulate-reading", s.requireRole("system_administrator", http.HandlerFunc(s.simulateDeviceReading)))
+	}
 	mux.Handle("GET /api/v1/admin/audit-logs", s.requireRole("system_administrator", http.HandlerFunc(s.auditLogs)))
+	mux.Handle("GET /api/v1/admin/activity", s.requireRole("system_administrator", http.HandlerFunc(s.adminActivity)))
 	mux.Handle("GET /api/v1/admin/settings", s.requireRole("system_administrator", http.HandlerFunc(s.getSettings)))
 	mux.Handle("PATCH /api/v1/admin/settings", s.requireRole("system_administrator", http.HandlerFunc(s.updateSettings)))
 	mux.Handle("GET /api/v1/admin/area-fees", s.requireRole("system_administrator", http.HandlerFunc(s.listAreaFees)))
 	mux.Handle("PUT /api/v1/admin/area-fees", s.requireRole("system_administrator", http.HandlerFunc(s.saveAreaFee)))
+	mux.Handle("GET /api/v1/admin/area-bin-fees", s.requireRole("system_administrator", http.HandlerFunc(s.listAreaBinFees)))
+	mux.Handle("PUT /api/v1/admin/area-bin-fees", s.requireRole("system_administrator", http.HandlerFunc(s.saveAreaBinFee)))
 	mux.Handle("GET /api/v1/admin/service-areas", s.requireRole("system_administrator", http.HandlerFunc(s.listAdminServiceAreas)))
 	mux.Handle("POST /api/v1/admin/service-areas", s.requireRole("system_administrator", http.HandlerFunc(s.createServiceArea)))
 	mux.Handle("PATCH /api/v1/admin/service-areas/{id}", s.requireRole("system_administrator", http.HandlerFunc(s.updateServiceArea)))
@@ -212,10 +235,34 @@ func (s *server) serviceInfo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"service_role": s.serviceRole})
 }
 
+func latestContainerFillLevel(ctx context.Context, q areaRowQuerier, containerID string) (string, error) {
+	var level string
+	err := q.QueryRow(ctx, `SELECT level FROM (
+		SELECT DISTINCT ON (sr.device_id) sr.fill_percent,sr.level,sr.measured_at
+		FROM sensor_readings sr JOIN devices d ON d.id=sr.device_id
+		WHERE d.container_id=$1 AND d.enabled
+			AND sr.measured_at > now()-make_interval(mins=>COALESCE((SELECT (value::text)::int FROM application_settings WHERE key='offline_after_minutes'),180))
+		ORDER BY sr.device_id,sr.measured_at DESC,sr.id DESC
+	) latest_per_sensor ORDER BY fill_percent DESC,measured_at DESC LIMIT 1`, containerID).Scan(&level)
+	return level, err
+}
+
+func fillLevelSeverity(level string) int {
+	switch level {
+	case "critical":
+		return 2
+	case "warning":
+		return 1
+	default:
+		return 0
+	}
+}
+
 func (s *server) ingestReading(w http.ResponseWriter, r *http.Request) {
+	_, simulatorRequest := r.Context().Value(simulatorRequestKey{}).(bool)
 	providedID := r.Header.Get("X-Device-ID")
 	providedToken := r.Header.Get("X-Device-Token")
-	if providedID == "" || providedToken == "" {
+	if providedID == "" || (providedToken == "" && !simulatorRequest) {
 		writeError(w, http.StatusUnauthorized, "invalid_device_credentials", "Device credentials are invalid")
 		return
 	}
@@ -249,7 +296,11 @@ func (s *server) ingestReading(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database_error", "Device configuration could not be loaded")
 		return
 	}
-	if !deviceTokenMatches(providedToken, storedHash) {
+	if simulatorRequest && !simulated {
+		writeError(w, http.StatusForbidden, "device_not_simulated", "Only a registered simulator device can generate test readings")
+		return
+	}
+	if !simulatorRequest && !deviceTokenMatches(providedToken, storedHash) {
 		writeError(w, http.StatusUnauthorized, "invalid_device_credentials", "Device credentials are invalid")
 		return
 	}
@@ -283,9 +334,9 @@ func (s *server) ingestReading(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(r.Context())
-	var lockedTokenHash string
+	var lockedTokenHash, containerID string
 	var lockedSimulated bool
-	err = tx.QueryRow(r.Context(), `SELECT token_hash,is_simulated FROM devices WHERE id=$1 AND enabled=true FOR UPDATE`, req.DeviceID).Scan(&lockedTokenHash, &lockedSimulated)
+	err = tx.QueryRow(r.Context(), `SELECT token_hash,is_simulated,container_id FROM devices WHERE id=$1 AND enabled=true FOR UPDATE`, req.DeviceID).Scan(&lockedTokenHash, &lockedSimulated, &containerID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		writeError(w, http.StatusUnauthorized, "invalid_device_credentials", "Device credentials are invalid")
 		return
@@ -294,14 +345,16 @@ func (s *server) ingestReading(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "reading_persistence_failed", "Device credentials could not be revalidated")
 		return
 	}
-	if !deviceTokenMatches(providedToken, lockedTokenHash) {
+	if simulatorRequest && !lockedSimulated {
+		writeError(w, http.StatusForbidden, "device_not_simulated", "Only a registered simulator device can generate test readings")
+		return
+	}
+	if !simulatorRequest && !deviceTokenMatches(providedToken, lockedTokenHash) {
 		writeError(w, http.StatusUnauthorized, "invalid_device_credentials", "Device credentials are invalid")
 		return
 	}
 	simulated = lockedSimulated
-	previousLevel := ""
-	var previousAt time.Time
-	prevErr := tx.QueryRow(r.Context(), `SELECT level,measured_at FROM sensor_readings WHERE device_id=$1 ORDER BY measured_at DESC LIMIT 1`, req.DeviceID).Scan(&previousLevel, &previousAt)
+	previousLevel, prevErr := latestContainerFillLevel(r.Context(), tx, containerID)
 	if prevErr != nil && !errors.Is(prevErr, pgx.ErrNoRows) {
 		writeError(w, http.StatusInternalServerError, "reading_persistence_failed", "Previous reading could not be loaded")
 		return
@@ -318,15 +371,25 @@ func (s *server) ingestReading(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "reading_persistence_failed", "Reading could not be saved")
 		return
 	}
-	if (result.Level == "warning" || result.Level == "critical") && result.Level != previousLevel && (prevErr != nil || req.MeasuredAt.After(previousAt)) {
+	if prevErr != nil {
+		previousLevel = "normal"
+	}
+	currentLevel, levelErr := latestContainerFillLevel(r.Context(), tx, containerID)
+	if errors.Is(levelErr, pgx.ErrNoRows) {
+		currentLevel = "normal"
+	} else if levelErr != nil {
+		writeError(w, http.StatusInternalServerError, "reading_persistence_failed", "Current container fill level could not be calculated")
+		return
+	}
+	if fillLevelSeverity(currentLevel) > fillLevelSeverity(previousLevel) {
 		var label string
 		if err := tx.QueryRow(r.Context(), `SELECT c.label FROM devices d JOIN containers c ON c.id=d.container_id WHERE d.id=$1`, req.DeviceID).Scan(&label); err != nil {
 			writeError(w, http.StatusInternalServerError, "reading_persistence_failed", "Container details for the reading alert could not be loaded")
 			return
 		}
 		dayKey := req.MeasuredAt.UTC().Format("2006-01-02")
-		key := req.DeviceID + ":" + result.Level + ":" + dayKey
-		_, err = tx.Exec(r.Context(), `INSERT INTO notifications(target_role,title,message,resource_type,resource_id,dedupe_key) VALUES('operations_manager',$1,$2,'device',$3,$4) ON CONFLICT(dedupe_key) DO NOTHING`, strings.ToUpper(result.Level)+" waste level", label+" reported a "+result.Level+" fill level.", req.DeviceID, key)
+		key := containerID + ":" + currentLevel + ":" + dayKey
+		_, err = tx.Exec(r.Context(), `INSERT INTO notifications(target_role,title,message,resource_type,resource_id,dedupe_key) VALUES('operations_manager',$1,$2,'container',$3,$4) ON CONFLICT(dedupe_key) DO NOTHING`, strings.ToUpper(currentLevel)+" waste level", label+" reached a "+currentLevel+" fill level based on its sensor readings.", containerID, key)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "reading_persistence_failed", "Reading alert could not be saved")
 			return
@@ -339,6 +402,74 @@ func (s *server) ingestReading(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "device_id": req.DeviceID, "measured_at": req.MeasuredAt.UTC(), "fill_percent": result.FillPercent, "level": result.Level, "simulated": simulated})
+}
+
+type simulatorRequestKey struct{}
+
+func (s *server) simulateDeviceReading(w http.ResponseWriter, r *http.Request) {
+	deviceID := strings.TrimSpace(r.PathValue("id"))
+	if deviceID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_device_id", "Device ID is required")
+		return
+	}
+	var input struct {
+		DistanceCM float64 `json:"distance_cm"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if input.DistanceCM < 0 {
+		writeError(w, http.StatusUnprocessableEntity, "invalid_reading", "Distance must be zero or greater")
+		return
+	}
+	body, err := json.Marshal(readingRequest{DeviceID: deviceID, MeasuredAt: time.Now().UTC(), DistanceCM: input.DistanceCM})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid_reading", "Test reading could not be prepared")
+		return
+	}
+	simulatedRequest := r.Clone(context.WithValue(r.Context(), simulatorRequestKey{}, true))
+	simulatedRequest.Body = io.NopCloser(strings.NewReader(string(body)))
+	simulatedRequest.Header.Set("X-Device-ID", deviceID)
+	s.ingestReading(w, simulatedRequest)
+}
+
+func (s *server) adminDeviceReadings(w http.ResponseWriter, r *http.Request) {
+	s.listSensorReadings(w, r, "d.id", strings.TrimSpace(r.PathValue("id")))
+}
+
+func (s *server) containerReadings(w http.ResponseWriter, r *http.Request) {
+	s.listSensorReadings(w, r, "d.container_id", strings.TrimSpace(r.PathValue("id")))
+}
+
+func (s *server) listSensorReadings(w http.ResponseWriter, r *http.Request, filterColumn, filterValue string) {
+	if filterValue == "" {
+		writeError(w, http.StatusBadRequest, "invalid_reference", "A device or container ID is required")
+		return
+	}
+	rows, err := s.db.Query(r.Context(), `SELECT r.id,d.id,r.measured_at::text,r.received_at::text,r.distance_cm,r.fill_percent,r.level,r.is_simulated
+		FROM sensor_readings r JOIN devices d ON d.id=r.device_id WHERE `+filterColumn+`=$1 ORDER BY r.measured_at DESC LIMIT 100`, filterValue)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "readings_unavailable", "Sensor readings could not be loaded")
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0)
+	for rows.Next() {
+		var id int64
+		var deviceID, measuredAt, receivedAt, level string
+		var distance, fill float64
+		var simulated bool
+		if err := rows.Scan(&id, &deviceID, &measuredAt, &receivedAt, &distance, &fill, &level, &simulated); err != nil {
+			writeError(w, http.StatusInternalServerError, "readings_unavailable", "Sensor readings could not be loaded")
+			return
+		}
+		items = append(items, map[string]any{"id": id, "device_id": deviceID, "measured_at": measuredAt, "received_at": receivedAt, "distance_cm": distance, "fill_percent": fill, "level": level, "simulated": simulated})
+	}
+	if rows.Err() != nil {
+		writeError(w, http.StatusInternalServerError, "readings_unavailable", "Sensor readings could not be loaded")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"readings": items})
 }
 
 func deviceTokenMatches(providedToken, storedHash string) bool {

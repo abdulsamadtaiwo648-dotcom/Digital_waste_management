@@ -16,45 +16,117 @@ var (
 	errLocationAreaUnresolved = errors.New("resident location has no resolved service area")
 	errServiceAreaInactive    = errors.New("service area is inactive or missing")
 	errAreaFeeUnconfigured    = errors.New("service area has no configured fee")
+	errBinFeeUnconfigured     = errors.New("a delivered bin has no configured size fee")
+	errBinPayerUnassigned     = errors.New("a delivered bin has no active billing contact")
 )
 
 type areaRowQuerier interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
+	Query(context.Context, string, ...any) (pgx.Rows, error)
 }
 
-func (s *server) feeForLocation(ctx context.Context, q areaRowQuerier, residentID, locationID int64, lock bool) (serviceArea, int64, error) {
+type deliveredBinFee struct {
+	BinID      int64 `json:"bin_id"`
+	SizeLitres int   `json:"size_litres"`
+	AmountKobo int64 `json:"amount_kobo"`
+}
+
+type serviceFeeBreakdown struct {
+	AreaFlatFeeKobo int64             `json:"area_flat_fee_kobo"`
+	BinSizeFeeKobo  int64             `json:"bin_size_fee_kobo"`
+	DeliveredBins   []deliveredBinFee `json:"delivered_bins"`
+}
+
+func (s *server) feeForLocation(ctx context.Context, q areaRowQuerier, residentID, locationID int64, lock bool) (serviceArea, int64, serviceFeeBreakdown, error) {
 	lockClause := ""
 	if lock {
 		lockClause = " FOR SHARE"
 	}
+	breakdown := serviceFeeBreakdown{DeliveredBins: make([]deliveredBinFee, 0)}
 	var areaID *int64
 	err := q.QueryRow(ctx, `SELECT area_id FROM resident_locations WHERE id=$1 AND resident_id=$2 AND deleted_at IS NULL`+lockClause, locationID, residentID).Scan(&areaID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return serviceArea{}, 0, errLocationNotFound
+		return serviceArea{}, 0, breakdown, errLocationNotFound
 	}
 	if err != nil {
-		return serviceArea{}, 0, err
+		return serviceArea{}, 0, breakdown, err
 	}
 	if areaID == nil || *areaID < 1 {
-		return serviceArea{}, 0, errLocationAreaUnresolved
+		return serviceArea{}, 0, breakdown, errLocationAreaUnresolved
 	}
 	var area serviceArea
 	err = q.QueryRow(ctx, `SELECT id,locality,city,state,is_active FROM service_areas WHERE id=$1`+lockClause, *areaID).Scan(&area.ID, &area.Locality, &area.City, &area.State, &area.Active)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && !area.Active) {
-		return serviceArea{}, 0, errServiceAreaInactive
+		return serviceArea{}, 0, breakdown, errServiceAreaInactive
 	}
 	if err != nil {
-		return serviceArea{}, 0, err
+		return serviceArea{}, 0, breakdown, err
 	}
 	var amount int64
 	err = q.QueryRow(ctx, `SELECT amount_kobo FROM area_waste_fees WHERE area_id=$1`+lockClause, area.ID).Scan(&amount)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return area, 0, errAreaFeeUnconfigured
+		return area, 0, breakdown, errAreaFeeUnconfigured
 	}
 	if err != nil {
-		return serviceArea{}, 0, err
+		return serviceArea{}, 0, breakdown, err
 	}
-	return area, amount, nil
+	breakdown.AreaFlatFeeKobo = amount
+	total := amount
+	var propertyID int64
+	propertyLock := ""
+	if lock {
+		propertyLock = " FOR SHARE OF p"
+	}
+	propertyErr := q.QueryRow(ctx, `SELECT p.id FROM registered_properties p JOIN resident_locations l ON l.area_id=p.area_id AND p.address_key=lower(btrim(l.address_line1)) WHERE l.id=$1 AND p.status<>'inactive'`+propertyLock, locationID).Scan(&propertyID)
+	if propertyErr != nil && !errors.Is(propertyErr, pgx.ErrNoRows) {
+		return serviceArea{}, 0, breakdown, propertyErr
+	}
+	if propertyErr == nil {
+		bins, queryErr := q.Query(ctx, `SELECT id,COALESCE(unit_id,0),size_litres,assigned_resident_id FROM property_bins WHERE property_id=$1 AND status='delivered' ORDER BY id`+lockClause, propertyID)
+		if queryErr != nil {
+			return serviceArea{}, 0, breakdown, queryErr
+		}
+		type deliveredBin struct {
+			id       int64
+			unit     int64
+			size     int
+			resident *int64
+		}
+		collected := make([]deliveredBin, 0)
+		for bins.Next() {
+			var bin deliveredBin
+			if scanErr := bins.Scan(&bin.id, &bin.unit, &bin.size, &bin.resident); scanErr != nil {
+				bins.Close()
+				return serviceArea{}, 0, breakdown, scanErr
+			}
+			collected = append(collected, bin)
+		}
+		queryErr = bins.Err()
+		bins.Close()
+		if queryErr != nil {
+			return serviceArea{}, 0, breakdown, queryErr
+		}
+		for _, bin := range collected {
+			if bin.resident == nil || *bin.resident < 1 {
+				return area, 0, breakdown, errBinPayerUnassigned
+			}
+			if *bin.resident != residentID {
+				continue
+			}
+			var binAmount int64
+			queryErr = q.QueryRow(ctx, `SELECT amount_kobo FROM area_bin_fees WHERE area_id=$1 AND size_litres=$2`+lockClause, area.ID, bin.size).Scan(&binAmount)
+			if errors.Is(queryErr, pgx.ErrNoRows) {
+				return area, 0, breakdown, errBinFeeUnconfigured
+			}
+			if queryErr != nil {
+				return serviceArea{}, 0, breakdown, queryErr
+			}
+			breakdown.DeliveredBins = append(breakdown.DeliveredBins, deliveredBinFee{BinID: bin.id, SizeLitres: bin.size, AmountKobo: binAmount})
+			breakdown.BinSizeFeeKobo += binAmount
+			total += binAmount
+		}
+	}
+	return area, total, breakdown, nil
 }
 
 type serviceArea struct {
@@ -66,6 +138,10 @@ type serviceArea struct {
 }
 
 func (s *server) listResidentServiceAreas(w http.ResponseWriter, r *http.Request) {
+	s.listServiceAreas(w, r, true)
+}
+
+func (s *server) listOperationsServiceAreas(w http.ResponseWriter, r *http.Request) {
 	s.listServiceAreas(w, r, true)
 }
 

@@ -54,6 +54,16 @@ if ($LASTEXITCODE -ne 0) { throw 'Resident location migration could not be appli
 if ($LASTEXITCODE -ne 0) { throw 'Area waste fee migration could not be applied.' }
 & $psql -v ON_ERROR_STOP=1 -f (Join-Path $root 'db\migrations\008_managed_service_areas.sql') $env:DATABASE_URL
 if ($LASTEXITCODE -ne 0) { throw 'Managed service-area migration could not be applied.' }
+& $psql -v ON_ERROR_STOP=1 -f (Join-Path $root 'db\migrations\009_property_unit_registration.sql') $env:DATABASE_URL
+if ($LASTEXITCODE -ne 0) { throw 'Migration 009 failed.' }
+& $psql -v ON_ERROR_STOP=1 -f (Join-Path $root 'db\migrations\010_property_lifecycle_and_reviews.sql') $env:DATABASE_URL
+if ($LASTEXITCODE -ne 0) { throw 'Migration 010 failed.' }
+& $psql -v ON_ERROR_STOP=1 -f (Join-Path $root 'db\migrations\011_property_application_review.sql') $env:DATABASE_URL
+if ($LASTEXITCODE -ne 0) { throw 'Migration 011 failed.' }
+& $psql -v ON_ERROR_STOP=1 -f (Join-Path $root 'db\migrations\012_property_unit_case_insensitive_uniqueness.sql') $env:DATABASE_URL
+if ($LASTEXITCODE -ne 0) { throw 'Migration 012 failed. Resolve any duplicate unit codes, then rerun.' }
+& $psql -v ON_ERROR_STOP=1 -f (Join-Path $root 'db\migrations\013_bin_account_and_evacuation.sql') $env:DATABASE_URL
+if ($LASTEXITCODE -ne 0) { throw 'Migration 013 failed.' }
 
 if (-not (Test-LocalPort 8090)) {
     Start-Process -FilePath (Get-Command python.exe).Source -ArgumentList 'backend/python/processor.py' -WorkingDirectory $root -RedirectStandardOutput (Join-Path $local 'processor.log') -RedirectStandardError (Join-Path $local 'processor-error.log') -WindowStyle Hidden | Out-Null
