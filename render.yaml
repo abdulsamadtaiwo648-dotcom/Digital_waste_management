@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: dwmp-resident-api
+    runtime: go
+    plan: free
+    region: frankfurt
+    buildCommand: go build -o app ./backend/go
+    startCommand: ./app
+    healthCheckPath: /healthz
+    autoDeployTrigger: off
+    envVars:
+      - key: GO_VERSION
+        value: 1.24.0
+      - key: PORT
+        value: 10000
+      - key: APP_ENV
+        value: production
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: PAYMENT_MODE
+        value: disabled
+      - key: DEV_RESET_LINKS
+        value: "false"
+      - key: SERVICE_ROLE
+        value: resident
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SERVICE_ORIGIN
+        sync: false
+
+  - type: web
+    name: dwmp-resident-demo
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build:resident
+    staticPublishPath: dist
+    autoDeployTrigger: off
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_RESIDENT_API_URL
+        fromService:
+          type: web
+          name: dwmp-resident-api
+          envVarKey: RENDER_EXTERNAL_URL

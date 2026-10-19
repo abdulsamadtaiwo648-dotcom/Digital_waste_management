@@ -270,69 +270,6 @@ func (s *server) saveAreaFee(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"id": id, "area_id": in.AreaID, "amount_kobo": in.AmountKobo})
 }
 
-func (s *server) listAreaBinFees(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `SELECT f.id,f.area_id,a.locality,a.city,a.state,f.size_litres,f.amount_kobo,f.updated_at::text FROM area_bin_fees f JOIN service_areas a ON a.id=f.area_id ORDER BY a.state,a.city,a.locality,f.size_litres`)
-	if err != nil {
-		writeError(w, 500, "area_bin_fees_unavailable", "Bin fees could not be loaded")
-		return
-	}
-	defer rows.Close()
-	items := make([]map[string]any, 0)
-	for rows.Next() {
-		var id, areaID int64
-		var locality, city, state, updated string
-		var size int
-		var amount int64
-		if err := rows.Scan(&id, &areaID, &locality, &city, &state, &size, &amount, &updated); err != nil {
-			writeError(w, 500, "area_bin_fees_unavailable", "Bin fees could not be loaded")
-			return
-		}
-		items = append(items, map[string]any{"id": id, "area_id": areaID, "area": strings.Join([]string{locality, city, state}, ", "), "size_litres": size, "amount_kobo": amount, "updated_at": updated})
-	}
-	if rows.Err() != nil {
-		writeError(w, 500, "area_bin_fees_unavailable", "Bin fees could not be loaded")
-		return
-	}
-	writeJSON(w, 200, map[string]any{"area_bin_fees": items})
-}
-
-func (s *server) saveAreaBinFee(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		AreaID     int64 `json:"area_id"`
-		Size       int   `json:"size_litres"`
-		AmountKobo int64 `json:"amount_kobo"`
-	}
-	if !decodeJSON(w, r, &in) {
-		return
-	}
-	if in.AreaID < 1 || !oneOf(strconv.Itoa(in.Size), "60", "120", "240", "660", "1100") || in.AmountKobo < 0 || in.AmountKobo > 1000000000000 {
-		writeError(w, 422, "invalid_area_bin_fee", "Select a managed area, supported bin size, and a non-negative fee")
-		return
-	}
-	current := r.Context().Value(userContextKey).(user)
-	tx, err := s.db.Begin(r.Context())
-	if err != nil {
-		writeError(w, 500, "area_bin_fee_save_failed", "Bin fee could not be saved")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	var id int64
-	err = tx.QueryRow(r.Context(), `INSERT INTO area_bin_fees(area_id,size_litres,amount_kobo,updated_by) SELECT id,$2,$3,$4 FROM service_areas WHERE id=$1 AND is_active ON CONFLICT(area_id,size_litres) DO UPDATE SET amount_kobo=excluded.amount_kobo,updated_by=excluded.updated_by,updated_at=now() RETURNING id`, in.AreaID, in.Size, in.AmountKobo, current.ID).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, 422, "service_area_unavailable", "Choose an existing active service area")
-		return
-	}
-	if err != nil {
-		writeError(w, 500, "area_bin_fee_save_failed", "Bin fee could not be saved")
-		return
-	}
-	if err = s.commitAudit(r.Context(), tx, current.ID, "area_bin_fee_saved", "area_bin_fee", strconv.FormatInt(id, 10), map[string]any{"area_id": in.AreaID, "size_litres": in.Size, "amount_kobo": in.AmountKobo}); err != nil {
-		writeError(w, 500, "area_bin_fee_save_failed", "Bin fee and audit record could not be saved")
-		return
-	}
-	writeJSON(w, 200, map[string]any{"id": id})
-}
-
 func (s *server) createDevice(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		ID          string `json:"id"`

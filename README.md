@@ -66,7 +66,13 @@ Citizen registration is public; staff accounts can only be created in the admini
 
 Device credentials are provisioned in the administrator workspace. The raw token is returned once; only its SHA-256 hash is stored. Mark simulator devices during registration so their saved readings are always identified as simulated. To send test readings, explicitly set `SIMULATOR_ENABLED=true`, provide the simulator device ID and token, then run `python backend/python/simulator.py`. The physical sensor and transport have not been verified.
 
-Payment requests stay disabled unless an administrator configures a fee and `PAYMENT_MODE=simulation` is enabled outside production. A resident can then complete a clearly marked demonstration payment; the system records that no funds moved. No real gateway or personal account is used.
+Each service area has one 60 L base fee. The charge for each delivered bin assigned to a resident scales in proportion to the bin's capacity: a 120 L bin costs twice the base fee, and the resident's total is the sum of their assigned bin prices. There is no additional area fee. Payment requests stay disabled unless an administrator configures the area's base fee and `PAYMENT_MODE=simulation` is enabled outside production. A resident can then complete a clearly marked demonstration payment; the system records that no funds moved. No real gateway or personal account is used.
+
+## Render resident demo
+
+`render.yaml` creates only the resident website and resident API. The management and admin workspaces are intentionally excluded from this public demo. The resident API uses a database URL entered in Render and starts in production mode with real payments and development password-reset links disabled. Do not connect a database containing real resident records. Create an empty demo database, apply migrations `001_iot.sql` through `013_bin_account_and_evacuation.sql` in order, then enter its connection URL as the `DATABASE_URL` secret when Render prompts for it. Enter the deployed resident website origin as `SERVICE_ORIGIN` when prompted. Render generates the session secret. The sensor processor is not deployed in this resident-only demo.
+
+In Render, create a Blueprint from this repository and select the `wonder` branch. The Blueprint creates a free Go web service and a free static site; free services can sleep when idle and have usage limits. Keep management and admin local until private access has been arranged.
 
 ## Verification
 

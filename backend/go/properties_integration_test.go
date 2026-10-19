@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +24,6 @@ func TestPropertyUnitAndBinWorkflow(t *testing.T) {
 	ownerID := addWorkflowUser(t, pool, "Property Owner", "property-owner@example.test", "citizen")
 	tenantID := addWorkflowUser(t, pool, "Property Tenant", "property-tenant@example.test", "citizen")
 	staffID := addWorkflowUser(t, pool, "Property Staff", "property-staff@example.test", "operations_manager")
-	adminID := addWorkflowUser(t, pool, "Property Admin", "property-admin@example.test", "system_administrator")
 	var areaID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO service_areas(locality,city,state) VALUES('Test Locality','Test City','Test State') RETURNING id`).Scan(&areaID); err != nil {
 		t.Fatal(err)
@@ -60,7 +60,7 @@ func TestPropertyUnitAndBinWorkflow(t *testing.T) {
 	if missingApplicationReason.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("application review without reason status %d, want 422: %s", missingApplicationReason.Code, missingApplicationReason.Body.String())
 	}
-	binBeforeReviewRequest := httptestRequestWithID(t, http.MethodPost, fmt.Sprintf("/api/v1/operations/properties/%d/bins", propertyID), "id", fmt.Sprint(propertyID), `{"tracking_id":"EARLY-BIN-1","unit_id":1,"size_litres":120}`, user{ID: staffID, Role: "operations_manager"})
+	binBeforeReviewRequest := httptestRequestWithID(t, http.MethodPost, fmt.Sprintf("/api/v1/operations/properties/%d/bins", propertyID), "id", fmt.Sprint(propertyID), `{"unit_id":1,"size_litres":120}`, user{ID: staffID, Role: "operations_manager"})
 	binBeforeReview := callHandler(s.createPropertyBin, binBeforeReviewRequest)
 	if binBeforeReview.Code != http.StatusNotFound {
 		t.Fatalf("bin should not be assigned before application review: status=%d response=%s", binBeforeReview.Code, binBeforeReview.Body.String())
@@ -144,15 +144,29 @@ func TestPropertyUnitAndBinWorkflow(t *testing.T) {
 	if len(units) != 2 {
 		t.Fatalf("property has %d units, want 2", len(units))
 	}
-	for i, unitID := range units {
-		body := fmt.Sprintf(`{"tracking_id":"TEST-BIN-%d","unit_id":%d,"size_litres":120}`, i+1, unitID)
+	var trackingIDs []string
+	for _, unitID := range units {
+		body := fmt.Sprintf(`{"unit_id":%d,"size_litres":120}`, unitID)
 		binReq := httptestRequestWithID(t, http.MethodPost, fmt.Sprintf("/api/v1/operations/properties/%d/bins", propertyID), "id", fmt.Sprint(propertyID), body, user{ID: staffID, Role: "operations_manager"})
 		binResponse := callHandler(s.createPropertyBin, binReq)
 		if binResponse.Code != http.StatusCreated {
 			t.Fatalf("bin registration status %d: %s", binResponse.Code, binResponse.Body.String())
 		}
+		var registeredBin struct {
+			ID         int64  `json:"id"`
+			TrackingID string `json:"tracking_id"`
+		}
+		if err := json.Unmarshal(binResponse.Body.Bytes(), &registeredBin); err != nil || registeredBin.ID < 1 || !strings.HasPrefix(registeredBin.TrackingID, "DWMP-") {
+			t.Fatalf("bin response did not contain a generated tracking ID: response=%s err=%v", binResponse.Body.String(), err)
+		}
+		for _, previous := range trackingIDs {
+			if previous == registeredBin.TrackingID {
+				t.Fatalf("duplicate generated tracking ID %q", registeredBin.TrackingID)
+			}
+		}
+		trackingIDs = append(trackingIDs, registeredBin.TrackingID)
 		var binID int64
-		if err := pool.QueryRow(ctx, `SELECT id FROM property_bins WHERE tracking_id=$1`, fmt.Sprintf("TEST-BIN-%d", i+1)).Scan(&binID); err != nil {
+		if err := pool.QueryRow(ctx, `SELECT id FROM property_bins WHERE tracking_id=$1`, registeredBin.TrackingID).Scan(&binID); err != nil {
 			t.Fatal(err)
 		}
 		deliveryReq := httptestRequestWithID(t, http.MethodPatch, fmt.Sprintf("/api/v1/operations/bins/%d/delivery", binID), "id", fmt.Sprint(binID), `{"outcome":"delivered","note":"Handover confirmed"}`, user{ID: staffID, Role: "operations_manager"})
@@ -160,7 +174,7 @@ func TestPropertyUnitAndBinWorkflow(t *testing.T) {
 		if delivery.Code != http.StatusOK {
 			t.Fatalf("bin delivery status %d: %s", delivery.Code, delivery.Body.String())
 		}
-		if i == 0 {
+		if len(trackingIDs) == 1 {
 			var status string
 			if err := pool.QueryRow(ctx, `SELECT status FROM registered_properties WHERE id=$1`, propertyID).Scan(&status); err != nil || status != "awaiting_bin_delivery" {
 				t.Fatalf("property status after only one of two handovers=%q err=%v", status, err)
@@ -172,7 +186,7 @@ func TestPropertyUnitAndBinWorkflow(t *testing.T) {
 		t.Fatalf("property status after all deliveries=%q err=%v", propertyStatus, err)
 	}
 	residentPropertyList := callAs(s.listProperties, http.MethodGet, "/api/v1/properties", "", user{ID: ownerID, Role: "citizen"})
-	if residentPropertyList.Code != http.StatusOK || !strings.Contains(residentPropertyList.Body.String(), "TEST-BIN-1") || !strings.Contains(residentPropertyList.Body.String(), "delivered_at") || !strings.Contains(residentPropertyList.Body.String(), `"review_status":"verified"`) || !strings.Contains(residentPropertyList.Body.String(), applicationApprovalReason) {
+	if residentPropertyList.Code != http.StatusOK || !strings.Contains(residentPropertyList.Body.String(), trackingIDs[0]) || !strings.Contains(residentPropertyList.Body.String(), "delivered_at") || !strings.Contains(residentPropertyList.Body.String(), `"review_status":"verified"`) || !strings.Contains(residentPropertyList.Body.String(), applicationApprovalReason) {
 		t.Fatalf("resident bin profile status=%d response=%s", residentPropertyList.Code, residentPropertyList.Body.String())
 	}
 	moveOutRequest := httptestRequestWithID(t, http.MethodDelete, fmt.Sprintf("/api/v1/locations/%d", tenantLocation), "id", fmt.Sprint(tenantLocation), "", user{ID: tenantID, Role: "citizen"})
@@ -182,11 +196,11 @@ func TestPropertyUnitAndBinWorkflow(t *testing.T) {
 	}
 	assertAuditRow(t, pool, "resident_address_removed", "resident_location", fmt.Sprint(tenantLocation), tenantID)
 	var preservedAddress, preservedBins bool
-	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM resident_locations WHERE id=$1 AND deleted_at IS NOT NULL), EXISTS(SELECT 1 FROM property_bins WHERE property_id=$2 AND tracking_id LIKE 'TEST-BIN-%')`, tenantLocation, propertyID).Scan(&preservedAddress, &preservedBins); err != nil || !preservedAddress || !preservedBins {
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM resident_locations WHERE id=$1 AND deleted_at IS NOT NULL), EXISTS(SELECT 1 FROM property_bins WHERE property_id=$2 AND tracking_id LIKE 'DWMP-%')`, tenantLocation, propertyID).Scan(&preservedAddress, &preservedBins); err != nil || !preservedAddress || !preservedBins {
 		t.Fatalf("move-out must preserve historical address/bin rows: address=%v bins=%v err=%v", preservedAddress, preservedBins, err)
 	}
 	tenantProperties := callAs(s.listProperties, http.MethodGet, "/api/v1/properties", "", user{ID: tenantID, Role: "citizen"})
-	if tenantProperties.Code != http.StatusOK || strings.Contains(tenantProperties.Body.String(), "TEST-BIN-") {
+	if tenantProperties.Code != http.StatusOK || strings.Contains(tenantProperties.Body.String(), trackingIDs[0]) || strings.Contains(tenantProperties.Body.String(), trackingIDs[1]) {
 		t.Fatalf("tenant retained active bin profile after move-out: status=%d response=%s", tenantProperties.Code, tenantProperties.Body.String())
 	}
 	var ended bool
@@ -196,14 +210,6 @@ func TestPropertyUnitAndBinWorkflow(t *testing.T) {
 	var tenantPropertyCount int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM property_account_memberships WHERE property_id=$1 AND user_id=$2 AND ended_at IS NULL`, propertyID, tenantID).Scan(&tenantPropertyCount); err != nil || tenantPropertyCount != 0 {
 		t.Fatalf("active tenant membership count=%d err=%v", tenantPropertyCount, err)
-	}
-	fee := callAs(s.saveAreaBinFee, http.MethodPut, "/api/v1/admin/area-bin-fees", fmt.Sprintf(`{"area_id":%d,"size_litres":120,"amount_kobo":8750}`, areaID), user{ID: adminID, Role: "system_administrator"})
-	if fee.Code != http.StatusOK {
-		t.Fatalf("area bin fee save status %d: %s", fee.Code, fee.Body.String())
-	}
-	var amount int64
-	if err := pool.QueryRow(ctx, `SELECT amount_kobo FROM area_bin_fees WHERE area_id=$1 AND size_litres=120`, areaID).Scan(&amount); err != nil || amount != 8750 {
-		t.Fatalf("stored fee=%d err=%v, want 8750 kobo", amount, err)
 	}
 	assertAuditRow(t, pool, "bin_delivery_recorded", "property_bin", "2", staffID)
 	assistedResident := addWorkflowUser(t, pool, "Assisted Resident", "assisted-resident@example.test", "citizen")

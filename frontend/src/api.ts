@@ -6,12 +6,13 @@ export type ComplaintUpdate = { status: string; note: string; created_at: string
 export type StaffRecord = { id: number; full_name: string; email: string; phone: string; role: string; created_at: string; active: boolean }
 export type ContainerRecord = { id: string; label: string; service_area: string; usable_depth_cm: number; active_sensor_count: number; latest_fill_percent: number | null; latest_level: string | null; last_reading_at: string | null }
 export type DeviceRecord = { id: string; container_id: string; container_label: string; container_depth_cm: number; minimum_distance_cm: number; installation_offset_cm: number; enabled: boolean; simulated: boolean; latest_fill_percent: number | null; latest_level: string | null; last_reading_at: string | null }
-export type ServiceFeeBreakdown = { area_flat_fee_kobo: number; bin_size_fee_kobo: number; delivered_bins: { bin_id: number; size_litres: number; amount_kobo: number }[] }
+export type ServiceFeeBreakdown = { area_flat_fee_kobo: number; base_bin_fee_kobo?: number; bin_size_fee_kobo: number; delivered_bins: { bin_id: number; size_litres: number; amount_kobo: number }[] }
 export type SensorReading = { id: number; device_id: string; measured_at: string; received_at: string; distance_cm: number; fill_percent: number; level: string; simulated: boolean }
 export type PaymentRecord = { reference: string; service_code: string; amount_kobo: number; status: string; mode: string; created_at: string; receipt_reference?: string | null; location_id?: number | null; location_label?: string }
 export type ResidentLocation = { id: number; area_id: number | null; label: string; address_line1: string; address_line2: string; locality: string; city: string; state: string; postal_code: string; latitude?: number; longitude?: number; property_registered?: boolean; property_relationship?: string }
 export type ServiceArea = { id: number; locality: string; city: string; state: string; active: boolean }
 export type PropertyUnit = { id: number; code: string; unit_type: string; floor_label: string; service_scope: string }
+export type BinEvacuationEvent = { id: number; evacuated_at: string; staff_name: string; note?: string }
 export type PropertyBin = { id: number; tracking_id: string; size_litres: number; status: string; unit_code?: string; registered_at: string; delivered_at?: string; delivered_by?: string; delivery_note?: string; assigned_to_you?: boolean; assigned_resident?: string; last_evacuated_at?: string; evacuated_by?: string }
 export type RegisteredProperty = { id: number; location_id: number; address: string; area: string; property_type: string; structure_type: string; floors: number; registration_scope: string; registrant_role: string; status: string; review_status: string; review_reason?: string; units: PropertyUnit[]; bins: PropertyBin[] }
 export type PropertyRegistration = { id: number; status: string; review_status: string; review_reason?: string; property_type: string; structure_type: string; registration_scope: string; registrant_role: string; address: string; resident: string; phone: string; units: { id: number; code: string; service_scope: string }[]; bins: PropertyBin[] }
@@ -37,8 +38,9 @@ const localAPI = appRole === 'admin'
 if (appRole !== 'resident' && appRole !== 'management' && appRole !== 'admin') {
   throw new Error(`VITE_APP_ROLE must be resident, management, or admin (got "${appRole}")`)
 }
-const API = configuredAPI
-  ? configuredAPI.replace(/\/$/, '')
+const configuredRoot = configuredAPI?.replace(/\/+$/, '')
+const API = configuredRoot
+  ? configuredRoot.endsWith('/api/v1') ? configuredRoot : `${configuredRoot}/api/v1`
   : import.meta.env.DEV
     ? localAPI
     : ''
@@ -63,10 +65,11 @@ export const api = {
   updateProfile: (data: { full_name: string; phone: string }) => request<{ user: User }>('/auth/me', { method: 'PATCH', body: JSON.stringify(data) }),
   locations: () => request<{ locations: ResidentLocation[] }>('/locations'),
   serviceAreas: () => request<{ service_areas: ServiceArea[] }>('/service-areas'),
-  createLocation: (data: { area_id: number; label: string; address_line1: string; address_line2: string; postal_code: string }) => request<{ location: ResidentLocation }>('/locations', { method: 'POST', body: JSON.stringify(data) }),
-  updateLocation: (id: number, data: { area_id: number; label: string; address_line1: string; address_line2: string; postal_code: string }) => request<{ location: ResidentLocation }>(`/locations/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  createLocation: (data: { area_id: number; label: string; address_line1: string; address_line2: string; postal_code: string; latitude?: number; longitude?: number }) => request<{ location: ResidentLocation }>('/locations', { method: 'POST', body: JSON.stringify(data) }),
+  updateLocation: (id: number, data: { area_id: number; label: string; address_line1: string; address_line2: string; postal_code: string; latitude?: number; longitude?: number }) => request<{ location: ResidentLocation }>(`/locations/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteLocation: (id: number) => request<void>(`/locations/${id}`, { method: 'DELETE' }),
   properties: () => request<{ properties: RegisteredProperty[] }>('/properties'),
+  binEvacuationHistory: (id: number, beforeId?: number) => request<{ events: BinEvacuationEvent[]; has_more: boolean; next_before_id: number | null }>(`/bins/${id}/evacuations${beforeId ? `?before_id=${beforeId}` : ''}`),
   registerProperty: (data: { location_id: number; property_type: string; structure_type: string; floors: number; registration_scope: string; registrant_role: string; units: { code: string; unit_type: string; floor_label: string; service_scope: string }[] }) => request<{ id: number }>('/properties', { method: 'POST', body: JSON.stringify(data) }),
   requestPropertyUnit: (data: { location_id: number; code: string; unit_type: string; floor_label: string; service_scope: string; relationship: string }) => request<{ id: number }>('/properties/unit-requests', { method: 'POST', body: JSON.stringify(data) }),
   residentPropertyUnitRequests: () => request<{ requests: { id: number; code: string; floor_label: string; relationship: string; status: string; review_reason: string; created_at: string; reviewed_at?: string }[] }>('/properties/unit-requests'),
@@ -97,7 +100,7 @@ export const api = {
   reviewPropertyUnitRequest: (id: number, decision: 'approved' | 'rejected', reason: string) => request<{ status: string }>(`/operations/property-unit-requests/${id}`, { method: 'PATCH', body: JSON.stringify({ decision, reason }) }),
   operationsServiceAreas: () => request<{ service_areas: ServiceArea[] }>('/operations/service-areas'),
   assistedPropertyRegistration: (data: { resident_email: string; area_id: number; label: string; address_line1: string; address_line2: string; postal_code: string; property_type: string; structure_type: string; floors: number; registration_scope: string; registrant_role: string; units: { code: string; unit_type: string; floor_label: string; service_scope: string }[] }) => request<{ id: number }>('/operations/assisted-properties', { method: 'POST', body: JSON.stringify(data) }),
-  createPropertyBin: (propertyId: number, data: { tracking_id: string; unit_id?: number | null; resident_email?: string; size_litres: number }) => request<{ id: number }>(`/operations/properties/${propertyId}/bins`, { method: 'POST', body: JSON.stringify(data) }),
+  createPropertyBin: (propertyId: number, data: { unit_id?: number | null; resident_email?: string; size_litres: number }) => request<{ id: number; tracking_id: string }>(`/operations/properties/${propertyId}/bins`, { method: 'POST', body: JSON.stringify(data) }),
   recordBinDelivery: (id: number, data: { outcome: 'delivered' | 'failed'; note: string }) => request<{ status: string }>(`/operations/bins/${id}/delivery`, { method: 'PATCH', body: JSON.stringify(data) }),
   recordBinEvacuation: (tracking_id: string, note = '', resident_email = '') => request<{ event_id: number; tracking_id: string; status: string; evacuated_at: string; unit_code: string; resident: { full_name: string; email: string } }>('/operations/bin-evacuations', { method: 'POST', body: JSON.stringify({ tracking_id, note, resident_email }) }),
   createContainer: (data: { label: string; service_area: string; usable_depth_cm: number; minimum_distance_cm: number; installation_offset_cm: number }) => request<{ id: string }>('/operations/containers', { method: 'POST', body: JSON.stringify(data) }),
@@ -125,8 +128,6 @@ export const api = {
   settings: () => request<{ settings: Record<string, number> }>('/admin/settings'),
   updateSettings: (data: Record<string, number>) => request<{ updated: boolean }>('/admin/settings', { method: 'PATCH', body: JSON.stringify(data) }),
   areaFees: () => request<{ area_fees: { id: number; area_id: number | null; area_name: string; locality: string | null; city: string | null; state: string | null; resolved: boolean; amount_kobo: number; updated_at: string }[] }>('/admin/area-fees'),
-  areaBinFees: () => request<{ area_bin_fees: { id: number; area_id: number; area: string; size_litres: number; amount_kobo: number; updated_at: string }[] }>('/admin/area-bin-fees'),
-  saveAreaBinFee: (area_id: number, size_litres: number, amount_kobo: number) => request<{ id: number }>('/admin/area-bin-fees', { method: 'PUT', body: JSON.stringify({ area_id, size_litres, amount_kobo }) }),
   serviceAreasAdmin: () => request<{ service_areas: ServiceArea[] }>('/admin/service-areas'),
   createServiceArea: (data: { locality: string; city: string; state: string }) => request<{ service_area: ServiceArea }>('/admin/service-areas', { method: 'POST', body: JSON.stringify(data) }),
   updateServiceArea: (id: number, active: boolean) => request<{ service_area: ServiceArea }>(`/admin/service-areas/${id}`, { method: 'PATCH', body: JSON.stringify({ active }) }),

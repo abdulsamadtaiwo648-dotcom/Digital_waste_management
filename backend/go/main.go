@@ -119,6 +119,7 @@ func main() {
 	mux.Handle("PATCH /api/v1/locations/{id}", s.requireUser(http.HandlerFunc(s.updateLocation)))
 	mux.Handle("DELETE /api/v1/locations/{id}", s.requireUser(http.HandlerFunc(s.deleteLocation)))
 	mux.Handle("GET /api/v1/properties", s.requireUser(http.HandlerFunc(s.listProperties)))
+	mux.Handle("GET /api/v1/bins/{id}/evacuations", s.requireUser(http.HandlerFunc(s.residentBinEvacuationHistory)))
 	mux.Handle("POST /api/v1/properties", s.requireUser(http.HandlerFunc(s.registerProperty)))
 	mux.Handle("POST /api/v1/properties/unit-requests", s.requireUser(http.HandlerFunc(s.requestPropertyUnit)))
 	mux.Handle("GET /api/v1/properties/unit-requests", s.requireUser(http.HandlerFunc(s.residentPropertyUnitRequests)))
@@ -174,14 +175,20 @@ func main() {
 	mux.Handle("PATCH /api/v1/admin/settings", s.requireRole("system_administrator", http.HandlerFunc(s.updateSettings)))
 	mux.Handle("GET /api/v1/admin/area-fees", s.requireRole("system_administrator", http.HandlerFunc(s.listAreaFees)))
 	mux.Handle("PUT /api/v1/admin/area-fees", s.requireRole("system_administrator", http.HandlerFunc(s.saveAreaFee)))
-	mux.Handle("GET /api/v1/admin/area-bin-fees", s.requireRole("system_administrator", http.HandlerFunc(s.listAreaBinFees)))
-	mux.Handle("PUT /api/v1/admin/area-bin-fees", s.requireRole("system_administrator", http.HandlerFunc(s.saveAreaBinFee)))
 	mux.Handle("GET /api/v1/admin/service-areas", s.requireRole("system_administrator", http.HandlerFunc(s.listAdminServiceAreas)))
 	mux.Handle("POST /api/v1/admin/service-areas", s.requireRole("system_administrator", http.HandlerFunc(s.createServiceArea)))
 	mux.Handle("PATCH /api/v1/admin/service-areas/{id}", s.requireRole("system_administrator", http.HandlerFunc(s.updateServiceArea)))
 	addr := ":" + envOr("PORT", servicePort(serviceRole))
 	logger.Info("Go API listening", "address", addr)
-	if err := http.ListenAndServe(addr, logRequests(logger, s.cors(s.onlyServiceRoutes(mux)))); err != nil {
+	apiServer := &http.Server{
+		Addr:              addr,
+		Handler:           logRequests(logger, s.cors(s.onlyServiceRoutes(mux))),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	if err := apiServer.ListenAndServe(); err != nil {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
 	}

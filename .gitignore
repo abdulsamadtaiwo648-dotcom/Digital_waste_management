@@ -9,3 +9,6 @@ bin/
 coverage.out
 /backend/go.exe
 /backend/go/package-lock.json
+.neon
+node_modules/
+.env.local

@@ -23,7 +23,7 @@ type payment struct {
 func (s *server) paymentOptions(w http.ResponseWriter, r *http.Request) {
 	locationID := strings.TrimSpace(r.URL.Query().Get("location_id"))
 	if locationID == "" {
-		writeJSON(w, 200, map[string]any{"enabled": false, "simulated": s.paymentSimulation, "fee_amount_kobo": 0, "message": "Choose a saved service address to check its area fee."})
+		writeJSON(w, 200, map[string]any{"enabled": false, "simulated": s.paymentSimulation, "fee_amount_kobo": 0, "message": "Choose a saved service address to check its service fee."})
 		return
 	}
 	id, err := strconv.ParseInt(locationID, 10, 64)
@@ -46,13 +46,17 @@ func (s *server) paymentOptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil && !errors.Is(err, errAreaFeeUnconfigured) {
-		if errors.Is(err, errBinFeeUnconfigured) {
+		if errors.Is(err, errUnsupportedBinSize) {
 			areaName := area.Locality + ", " + area.City + ", " + area.State
-			writeJSON(w, 200, map[string]any{"enabled": false, "simulated": s.paymentSimulation, "fee_amount_kobo": 0, "fee_breakdown": breakdown, "area_id": area.ID, "area_name": areaName, "message": "A fee has not been configured for every delivered bin size at this address. Contact service management before paying."})
+			writeJSON(w, 200, map[string]any{"enabled": false, "simulated": s.paymentSimulation, "fee_amount_kobo": 0, "fee_breakdown": breakdown, "area_id": area.ID, "area_name": areaName, "message": "A delivered bin has an unsupported size. Contact service management before paying."})
 			return
 		}
 		if errors.Is(err, errBinPayerUnassigned) {
 			writeJSON(w, 200, map[string]any{"enabled": false, "simulated": s.paymentSimulation, "fee_amount_kobo": 0, "fee_breakdown": breakdown, "area_id": area.ID, "message": "A delivered bin is not linked to an active unit billing contact. Contact service management before paying."})
+			return
+		}
+		if errors.Is(err, errNoBillableBins) {
+			writeJSON(w, 200, map[string]any{"enabled": false, "simulated": s.paymentSimulation, "fee_amount_kobo": 0, "fee_breakdown": breakdown, "area_id": area.ID, "area_name": area.Locality + ", " + area.City + ", " + area.State, "message": "No delivered bin is assigned to this account yet. Contact service management before paying."})
 			return
 		}
 		writeError(w, 500, "payment_options_unavailable", "The area fee could not be loaded")
@@ -132,7 +136,7 @@ func (s *server) createPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 409, "service_area_unavailable", "This address is assigned to an inactive service area. No payment was initialized.")
 		return
 	}
-	if errors.Is(err, errBinFeeUnconfigured) {
+	if errors.Is(err, errUnsupportedBinSize) {
 		writeError(w, http.StatusServiceUnavailable, "bin_fee_unconfigured", "A fee has not been configured for every delivered bin size. No payment was attempted.")
 		return
 	}
@@ -140,8 +144,12 @@ func (s *server) createPayment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "bin_payer_unassigned", "A delivered bin is not linked to an active unit billing contact. No payment was attempted.")
 		return
 	}
+	if errors.Is(err, errNoBillableBins) {
+		writeError(w, http.StatusConflict, "no_billable_bins", "No delivered bin is assigned to this account. No payment was attempted.")
+		return
+	}
 	if err != nil || amount <= 0 {
-		writeError(w, http.StatusServiceUnavailable, "fee_unconfigured", "No waste fee is configured for this service address area. No payment was attempted.")
+		writeError(w, http.StatusServiceUnavailable, "fee_unconfigured", "No applicable waste fee is configured for this service address. No payment was attempted.")
 		return
 	}
 	reference, err := paymentReference()

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"net/http"
 	"strconv"
@@ -9,6 +11,14 @@ import (
 
 	"github.com/jackc/pgx/v5"
 )
+
+func newBinTrackingID() (string, error) {
+	var random [16]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", err
+	}
+	return "DWMP-" + strings.ToUpper(hex.EncodeToString(random[:])), nil
+}
 
 type propertyUnitInput struct {
 	Code       string `json:"code"`
@@ -39,6 +49,13 @@ type propertyBinView struct {
 	AssignedResident string     `json:"assigned_resident,omitempty"`
 	LastEvacuatedAt  *time.Time `json:"last_evacuated_at,omitempty"`
 	EvacuatedBy      string     `json:"evacuated_by,omitempty"`
+}
+
+type binEvacuationEventView struct {
+	ID          int64     `json:"id"`
+	EvacuatedAt time.Time `json:"evacuated_at"`
+	StaffName   string    `json:"staff_name"`
+	Note        string    `json:"note,omitempty"`
 }
 
 type registeredPropertyView struct {
@@ -181,6 +198,7 @@ func (s *server) listProperties(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "properties_unavailable", "Property registrations could not be loaded")
 		return
 	}
+	rows.Close()
 	binRows, err := s.db.Query(r.Context(), `SELECT DISTINCT ON (p.id,b.id) p.id,b.id,b.tracking_id,b.size_litres,b.status,COALESCE(u.unit_code,''),b.created_at,b.delivered_at,COALESCE(deliverer.full_name,''),COALESCE(event.note,''),COALESCE(b.assigned_resident_id=$1,false),evacuation.evacuated_at,COALESCE(evacuator.full_name,'') FROM property_account_memberships m JOIN registered_properties p ON p.id=m.property_id JOIN property_bins b ON b.property_id=p.id AND (b.unit_id IS NULL OR b.unit_id=m.unit_id) LEFT JOIN property_units u ON u.id=b.unit_id LEFT JOIN users deliverer ON deliverer.id=b.delivered_by LEFT JOIN LATERAL (SELECT note FROM bin_delivery_events WHERE bin_id=b.id ORDER BY created_at DESC,id DESC LIMIT 1) event ON true LEFT JOIN LATERAL (SELECT evacuated_at,staff_id FROM bin_evacuation_events WHERE bin_id=b.id ORDER BY evacuated_at DESC,id DESC LIMIT 1) evacuation ON true LEFT JOIN users evacuator ON evacuator.id=evacuation.staff_id WHERE m.user_id=$1 AND m.ended_at IS NULL ORDER BY p.id,b.id`, current.ID)
 	if err != nil {
 		writeError(w, 500, "properties_unavailable", "Property bin records could not be loaded")
@@ -202,7 +220,83 @@ func (s *server) listProperties(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "properties_unavailable", "Property bin records could not be loaded")
 		return
 	}
+	binRows.Close()
 	writeJSON(w, 200, map[string]any{"properties": items})
+}
+
+func (s *server) residentBinEvacuationHistory(w http.ResponseWriter, r *http.Request) {
+	binID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || binID < 1 {
+		writeError(w, http.StatusBadRequest, "invalid_bin", "Bin ID is invalid")
+		return
+	}
+	current := r.Context().Value(userContextKey).(user)
+	var visible bool
+	err = s.db.QueryRow(r.Context(), `SELECT EXISTS(
+		SELECT 1 FROM property_bins b
+		WHERE b.id=$1 AND EXISTS (
+			SELECT 1 FROM property_account_memberships m
+			WHERE m.property_id=b.property_id AND m.user_id=$2 AND m.ended_at IS NULL
+			AND (b.unit_id IS NULL OR b.unit_id=m.unit_id)
+		)
+	)`, binID, current.ID).Scan(&visible)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "bin_history_unavailable", "Bin collection history could not be loaded")
+		return
+	}
+	if !visible {
+		writeError(w, http.StatusNotFound, "bin_not_found", "Bin was not found")
+		return
+	}
+	limit := 20
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		parsed, parseErr := strconv.Atoi(raw)
+		if parseErr != nil || parsed < 1 || parsed > 100 {
+			writeError(w, http.StatusBadRequest, "invalid_limit", "History limit must be between 1 and 100")
+			return
+		}
+		limit = parsed
+	}
+	beforeID := int64(0)
+	if raw := r.URL.Query().Get("before_id"); raw != "" {
+		beforeID, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || beforeID < 1 {
+			writeError(w, http.StatusBadRequest, "invalid_cursor", "History cursor is invalid")
+			return
+		}
+	}
+	rows, err := s.db.Query(r.Context(), `SELECT e.id,e.evacuated_at,COALESCE(staff.full_name,''),e.note
+		FROM bin_evacuation_events e LEFT JOIN users staff ON staff.id=e.staff_id
+		WHERE e.bin_id=$1 AND ($2=0 OR e.id<$2)
+		ORDER BY e.id DESC LIMIT $3`, binID, beforeID, limit+1)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "bin_history_unavailable", "Bin collection history could not be loaded")
+		return
+	}
+	defer rows.Close()
+	events := make([]binEvacuationEventView, 0, limit+1)
+	for rows.Next() {
+		var event binEvacuationEventView
+		if err := rows.Scan(&event.ID, &event.EvacuatedAt, &event.StaffName, &event.Note); err != nil {
+			writeError(w, http.StatusInternalServerError, "bin_history_unavailable", "Bin collection history could not be loaded")
+			return
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		writeError(w, http.StatusInternalServerError, "bin_history_unavailable", "Bin collection history could not be loaded")
+		return
+	}
+	hasMore := len(events) > limit
+	if hasMore {
+		events = events[:limit]
+	}
+	var nextBeforeID *int64
+	if hasMore && len(events) > 0 {
+		cursor := events[len(events)-1].ID
+		nextBeforeID = &cursor
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": events, "has_more": hasMore, "next_before_id": nextBeforeID})
 }
 
 func (s *server) operationsProperties(w http.ResponseWriter, r *http.Request) {
@@ -292,7 +386,6 @@ func (s *server) createPropertyBin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		TrackingID    string `json:"tracking_id"`
 		UnitID        *int64 `json:"unit_id"`
 		ResidentEmail string `json:"resident_email"`
 		Size          int    `json:"size_litres"`
@@ -300,10 +393,14 @@ func (s *server) createPropertyBin(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in) {
 		return
 	}
-	in.TrackingID = strings.TrimSpace(in.TrackingID)
 	in.ResidentEmail = strings.TrimSpace(strings.ToLower(in.ResidentEmail))
-	if len(in.TrackingID) < 4 || len(in.TrackingID) > 80 || len(in.ResidentEmail) > 254 || in.Size < 1 {
-		writeError(w, 422, "invalid_bin", "Enter the printed bin tracking ID and a bin size in litres")
+	if len(in.ResidentEmail) > 254 || in.Size < 1 {
+		writeError(w, 422, "invalid_bin", "Choose a resident account and enter a bin size in litres")
+		return
+	}
+	trackingID, err := newBinTrackingID()
+	if err != nil {
+		writeError(w, 500, "bin_save_failed", "A bin tracking ID could not be generated")
 		return
 	}
 	tx, err := s.db.Begin(r.Context())
@@ -349,16 +446,16 @@ func (s *server) createPropertyBin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var binID int64
-	err = tx.QueryRow(r.Context(), `INSERT INTO property_bins(property_id,unit_id,assigned_resident_id,tracking_id,size_litres,created_by) SELECT p.id,$2,$3,$4,$5,$6 FROM registered_properties p WHERE p.id=$1 AND p.status IN ('awaiting_bin_delivery','needs_review') AND p.review_status='awaiting_bin_delivery' AND (($2::bigint IS NULL AND EXISTS(SELECT 1 FROM property_units u WHERE u.property_id=p.id AND u.service_scope='shared_bin')) OR ($2::bigint IS NOT NULL AND EXISTS(SELECT 1 FROM property_units u WHERE u.id=$2 AND u.property_id=p.id AND u.service_scope='individual_bin'))) RETURNING id`, propertyID, in.UnitID, residentID, in.TrackingID, in.Size, current.ID).Scan(&binID)
+	err = tx.QueryRow(r.Context(), `INSERT INTO property_bins(property_id,unit_id,assigned_resident_id,tracking_id,size_litres,created_by) SELECT p.id,$2,$3,$4,$5,$6 FROM registered_properties p WHERE p.id=$1 AND p.status IN ('awaiting_bin_delivery','needs_review') AND p.review_status='awaiting_bin_delivery' AND (($2::bigint IS NULL AND EXISTS(SELECT 1 FROM property_units u WHERE u.property_id=p.id AND u.service_scope='shared_bin')) OR ($2::bigint IS NOT NULL AND EXISTS(SELECT 1 FROM property_units u WHERE u.id=$2 AND u.property_id=p.id AND u.service_scope='individual_bin'))) RETURNING id`, propertyID, in.UnitID, residentID, trackingID, in.Size, current.ID).Scan(&binID)
 	if err != nil {
-		writeError(w, 422, "property_or_bin_unavailable", "Property or unit was not found, or this tracking ID is already registered")
+		writeError(w, 422, "property_or_bin_unavailable", "Property or unit was not found, or the bin could not be assigned")
 		return
 	}
 	if err = s.commitAudit(r.Context(), tx, current.ID, "property_bin_registered", "property_bin", strconv.FormatInt(binID, 10), map[string]any{"property_id": propertyID, "unit_id": in.UnitID, "size_litres": in.Size}); err != nil {
 		writeError(w, 500, "bin_save_failed", "Bin registration could not be recorded")
 		return
 	}
-	writeJSON(w, 201, map[string]int64{"id": binID})
+	writeJSON(w, 201, map[string]any{"id": binID, "tracking_id": trackingID})
 }
 
 func (s *server) recordBinDelivery(w http.ResponseWriter, r *http.Request) {

@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from './api'
-import type { ResidentLocation, ServiceArea } from './api'
+import type { BinEvacuationEvent, ResidentLocation, ServiceArea } from './api'
+import { GoogleAddressPicker } from './GoogleAddressPicker'
 
 function areaLabel(area: ServiceArea) {
   return `${area.locality}, ${area.city}, ${area.state}`
@@ -15,6 +16,42 @@ function statusLabel(value: string) {
   return value.replaceAll('_', ' ').replace(/^./, character => character.toUpperCase())
 }
 
+export function BinEvacuationHistory({ binID }: { binID: number }) {
+  const [events, setEvents] = useState<BinEvacuationEvent[]>([])
+  const [nextBeforeID, setNextBeforeID] = useState<number | null>(null)
+  const [hasMore, setHasMore] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  async function load(beforeID?: number) {
+    setBusy(true)
+    setError('')
+    try {
+      const result = await api.binEvacuationHistory(binID, beforeID)
+      setEvents(current => beforeID ? [...current, ...result.events] : result.events)
+      setNextBeforeID(result.next_before_id)
+      setHasMore(result.has_more)
+      setLoaded(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Collection history could not be loaded')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <details className="evacuation-history" onToggle={event => {
+    if (event.currentTarget.open && !loaded && !busy) void load()
+  }}>
+    <summary>Collection history</summary>
+    {busy && events.length === 0 ? <p>Loading collection history…</p> : null}
+    {error && <div><p className="form-error" role="alert">{error}</p><button type="button" className="link-button" disabled={busy} onClick={() => void load()}>Try again</button></div>}
+    {!busy && !error && events.length === 0 && loaded && <p>No collections recorded yet.</p>}
+    {events.length > 0 && <ol>{events.map(item => <li key={item.id}><time>{new Date(item.evacuated_at).toLocaleString()}</time><span>{item.staff_name || 'Service team'}</span>{item.note && <p>{item.note}</p>}</li>)}</ol>}
+    {hasMore && <button type="button" className="link-button" disabled={busy} onClick={() => nextBeforeID && void load(nextBeforeID)}>{busy ? 'Loading…' : 'Load older collections'}</button>}
+  </details>
+}
+
 export function ManagedLocationsPanel() {
   const [items, setItems] = useState<ResidentLocation[]>([])
   const [areas, setAreas] = useState<ServiceArea[]>([])
@@ -22,6 +59,9 @@ export function ManagedLocationsPanel() {
   const [busy, setBusy] = useState(false)
   const [editingId, setEditingId] = useState<number | null>(null)
   const [selectedArea, setSelectedArea] = useState('')
+  const [addressLine1, setAddressLine1] = useState('')
+  const [postalCode, setPostalCode] = useState('')
+  const [coordinates, setCoordinates] = useState<{ latitude: number; longitude: number } | null>(null)
 
   const load = async () => {
     const [locations, serviceAreas] = await Promise.all([api.locations(), api.serviceAreas()])
@@ -36,8 +76,9 @@ export function ManagedLocationsPanel() {
     const d = new FormData(form)
     setBusy(true); setError('')
     try {
-      await api.createLocation({ area_id: Number(d.get('area_id')), label: String(d.get('label')), address_line1: String(d.get('address_line1')), address_line2: String(d.get('address_line2')), postal_code: String(d.get('postal_code')) })
+      await api.createLocation({ area_id: Number(d.get('area_id')), label: String(d.get('label')), address_line1: String(d.get('address_line1')), address_line2: String(d.get('address_line2')), postal_code: String(d.get('postal_code')), ...(coordinates ?? {}) })
       form.reset()
+      setAddressLine1(''); setPostalCode(''); setCoordinates(null)
       await load()
     } catch (e) { setError(e instanceof Error ? e.message : 'Address could not be saved') }
     finally { setBusy(false) }
@@ -67,12 +108,13 @@ export function ManagedLocationsPanel() {
     <section className="panel form-panel">
       <h2>Add a home or business</h2>
       <form className="form-grid" onSubmit={submit}>
+        <div className="address-map-field"><GoogleAddressPicker onAddress={result => { setAddressLine1(result.addressLine1); setPostalCode(result.postalCode); setCoordinates({ latitude: result.latitude, longitude: result.longitude }) }}/></div>
         <label className="field"><span>Property label</span><input name="label" placeholder="Home, Shop, Workshop" required maxLength={80}/></label>
-        <label className="field"><span>Street address</span><input name="address_line1" autoComplete="address-line1" required maxLength={180}/></label>
+        <label className="field"><span>Street address</span><input name="address_line1" autoComplete="address-line1" required maxLength={180} value={addressLine1} onChange={e => setAddressLine1(e.target.value)}/></label>
         <label className="field"><span>Apartment or suite (optional)</span><input name="address_line2" autoComplete="address-line2" maxLength={180}/></label>
         <label className="field"><span>Service area</span><select name="area_id" required defaultValue=""><option value="" disabled>{areas.length ? 'Choose locality, city and state' : 'No active service areas available'}</option>{areas.map(a => <option key={a.id} value={a.id}>{areaLabel(a)}</option>)}</select></label>
-        <label className="field"><span>Postal code (optional)</span><input name="postal_code" autoComplete="postal-code" maxLength={24}/></label>
-        <p className="muted form-hint">Locality, city and state are filled from the selected managed area.</p>
+        <label className="field"><span>Postal code (optional)</span><input name="postal_code" autoComplete="postal-code" maxLength={24} value={postalCode} onChange={e => setPostalCode(e.target.value)}/></label>
+        <p className="muted form-hint">Review the suggested street address, then choose the correct managed service area. The map does not determine service-area boundaries.</p>
         {error && <p className="form-error" role="alert">{error}</p>}
         <button className="button" disabled={busy || areas.length === 0}>{busy ? 'Saving…' : 'Save address'}</button>
       </form>
@@ -149,22 +191,22 @@ export function PropertyRegistrationPanel() {
       <form className="form-grid" onSubmit={requestUnit}><label className="field"><span>Saved address</span><select name="location_id" required defaultValue=""><option value="" disabled>Choose the matching address</option>{locations.map(x=><option key={x.id} value={x.id}>{x.label} — {x.address_line1}, {x.locality}, {x.city}</option>)}</select></label><label className="field"><span>Unit name</span><input name="code" required maxLength={80} placeholder="Upstairs flat or Shop C"/></label><label className="field"><span>Floor</span><input name="floor_label" maxLength={80} placeholder="First floor"/></label><label className="field"><span>Unit type</span><select name="unit_type"><option value="residential">Flat or residence</option><option value="shop">Shop</option><option value="office">Office</option><option value="other">Other</option></select></label><label className="field"><span>Bin arrangement</span><select name="service_scope"><option value="individual_bin">Individual bin</option><option value="shared_bin">Shared property bin</option></select></label><label className="field"><span>Your role</span><select name="relationship"><option value="tenant">Tenant</option><option value="owner">Owner</option><option value="caretaker">Caretaker</option><option value="agent">Agent</option></select></label><button className="button" disabled={busy || locations.length === 0}>{busy ? 'Submitting…' : 'Request unit access'}</button></form>
     </div>
     {unitRequests.length > 0 && <div className="panel-subsection"><h3>Unit access requests</h3>{unitRequests.map(request=><article className="location-row" key={request.id}><div><strong>{request.code}{request.floor_label?` · ${request.floor_label}`:''}</strong><p>{statusLabel(request.status)}{request.review_reason?` · ${request.review_reason}`:''}</p></div></article>)}</div>}
-    {properties.length > 0 && <div className="panel-subsection"><h3>Your registered properties</h3>{properties.map(p => <article className="location-row" key={p.id}><div><strong>{p.address}</strong><p>{p.area} · <span className={`status status-${p.review_status}`}>{statusLabel(p.review_status)}</span>{p.review_reason&&<span> · {p.review_reason}</span>}</p><p>Units: {p.units.map(u => u.code).join(', ')}</p>{p.bins.length>0&&<div><strong>Bin profiles and collection activity</strong>{p.bins.map(b=><p key={b.id}>{b.tracking_id} · {b.size_litres} L{b.unit_code?` · ${b.unit_code}`:''} · {b.status.replaceAll('_',' ')}{b.assigned_to_you?' · Assigned to your account':''}{b.registered_at?` · Registered ${new Date(b.registered_at).toLocaleDateString()}`:''}{b.delivered_at?` · Delivered ${new Date(b.delivered_at).toLocaleDateString()}`:''}{b.last_evacuated_at?` · Last evacuated ${new Date(b.last_evacuated_at).toLocaleString()}${b.evacuated_by?` by ${b.evacuated_by}`:''}`:' · No evacuation recorded yet'}{b.delivery_note?` · ${b.delivery_note}`:''}</p>)}</div>}</div></article>)}</div>}
+    {properties.length > 0 && <div className="panel-subsection"><h3>Your registered properties</h3>{properties.map(p => <article className="location-row" key={p.id}><div><strong>{p.address}</strong><p>{p.area} · <span className={`status status-${p.review_status}`}>{statusLabel(p.review_status)}</span>{p.review_reason&&<span> · {p.review_reason}</span>}</p><p>Units: {p.units.map(u => u.code).join(', ')}</p>{p.bins.length>0&&<div><strong>Bin profiles and collection activity</strong>{p.bins.map(b=><div key={b.id}><p>{b.tracking_id} · {b.size_litres} L{b.unit_code?` · ${b.unit_code}`:''} · {b.status.replaceAll('_',' ')}{b.assigned_to_you?' · Assigned to your account':''}{b.registered_at?` · Registered ${new Date(b.registered_at).toLocaleDateString()}`:''}{b.delivered_at?` · Delivered ${new Date(b.delivered_at).toLocaleDateString()}`:''}{b.last_evacuated_at?` · Last evacuated ${new Date(b.last_evacuated_at).toLocaleString()}${b.evacuated_by?` by ${b.evacuated_by}`:''}`:' · No evacuation recorded yet'}{b.delivery_note?` · ${b.delivery_note}`:''}</p><BinEvacuationHistory binID={b.id}/></div>)}</div>}</div></article>)}</div>}
   </section>
 }
 
 export function ManagedAreaFees() {
   const [areas, setAreas] = useState<ServiceArea[]>([])
   const [fees, setFees] = useState<Awaited<ReturnType<typeof api.areaFees>>['area_fees']>([])
-  const [binFees, setBinFees] = useState<Awaited<ReturnType<typeof api.areaBinFees>>['area_bin_fees']>([])
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
   const [legacyArea, setLegacyArea] = useState<Record<number, string>>({})
+  const [baseFeePreview, setBaseFeePreview] = useState('')
 
   const load = async () => {
-    const [a, f, bf] = await Promise.all([api.serviceAreasAdmin(), api.areaFees(), api.areaBinFees()])
-    setAreas(a.service_areas); setFees(f.area_fees); setBinFees(bf.area_bin_fees)
+    const [a, f] = await Promise.all([api.serviceAreasAdmin(), api.areaFees()])
+    setAreas(a.service_areas); setFees(f.area_fees)
   }
   useEffect(() => { load().catch(e => setError(e.message)) }, [])
 
@@ -179,13 +221,6 @@ export function ManagedAreaFees() {
     e.preventDefault(); const d = new FormData(e.currentTarget); setBusy(true); setError(''); setMessage('')
     try { await api.saveAreaFee(Number(d.get('area_id')), Math.round(Number(d.get('amount_naira')) * 100)); await load(); setMessage('Area fee saved in kobo.') }
     catch (e) { setError(e instanceof Error ? e.message : 'Area fee could not be saved') }
-    finally { setBusy(false) }
-  }
-
-  async function saveBinFee(e: FormEvent<HTMLFormElement>) {
-    e.preventDefault(); const d = new FormData(e.currentTarget); setBusy(true); setError(''); setMessage('')
-    try { await api.saveAreaBinFee(Number(d.get('area_id')), Number(d.get('size_litres')), Math.round(Number(d.get('amount_naira')) * 100)); await load(); setMessage('Area and bin-size fee saved in kobo.') }
-    catch (e) { setError(e instanceof Error ? e.message : 'Bin fee could not be saved') }
     finally { setBusy(false) }
   }
 
@@ -209,14 +244,10 @@ export function ManagedAreaFees() {
       <form className="form-grid" onSubmit={createArea}><label className="field"><span>Locality</span><input name="locality" required maxLength={120}/></label><label className="field"><span>City or town</span><input name="city" required maxLength={120}/></label><label className="field"><span>State</span><input name="state" required maxLength={120}/></label><button className="button" disabled={busy}>Create service area</button></form>
     </section>
     <section className="panel"><h2>Service areas</h2>{areas.length === 0 ? <p className="empty-inline">No managed service areas have been added.</p> : <div className="table-wrap"><table><thead><tr><th>Service area</th><th>Status</th><th/></tr></thead><tbody>{areas.map(a => <tr key={a.id}><td>{areaLabel(a)}</td><td>{a.active ? 'Active' : 'Inactive'}</td><td><button className="link-button" disabled={busy} onClick={() => toggle(a)}>{a.active ? 'Deactivate' : 'Activate'}</button></td></tr>)}</tbody></table></div>}</section>
-    <section className="panel settings-panel"><h2>Waste fees by service area</h2><p className="muted">Fees are saved in kobo and attached to a managed area ID.</p>
-      <form className="form-stack" onSubmit={saveFee}><label className="field"><span>Service area</span><select name="area_id" required defaultValue=""><option value="" disabled>Choose area</option>{areas.filter(a => a.active).map(a => <option key={a.id} value={a.id}>{areaLabel(a)}</option>)}</select></label><label className="field"><span>Waste fee (NGN)</span><input name="amount_naira" type="number" min="0" step="0.01" required/></label><button className="button" disabled={busy || !areas.some(a => a.active)}>Save fee</button></form>
+    <section className="panel settings-panel"><h2>Waste fee by service area</h2><p className="muted">Set one base fee per area for a 60 L bin. Each delivered bin assigned to a resident is charged in proportion to its capacity: 120 L costs twice the base and 240 L costs four times the base. If a resident has multiple bins, their charge is the sum of those bin prices; there is no additional area fee.</p>
+      <form className="form-stack" onSubmit={saveFee}><label className="field"><span>Service area</span><select name="area_id" required defaultValue=""><option value="" disabled>Choose area</option>{areas.filter(a => a.active).map(a => <option key={a.id} value={a.id}>{areaLabel(a)}</option>)}</select></label><label className="field"><span>Base fee for 60 L (NGN)</span><input name="amount_naira" type="number" min="0" step="0.01" required value={baseFeePreview} onChange={e => setBaseFeePreview(e.target.value)}/></label><div className="table-wrap"><table><thead><tr><th>Bin capacity</th><th>Calculated fee</th></tr></thead><tbody>{[60, 120, 240, 660, 1100].map(size => <tr key={size}><td>{size} L</td><td>{baseFeePreview && Number.isFinite(Number(baseFeePreview)) ? money(Math.ceil(Number(baseFeePreview) * 100 * size / 60)) : 'Enter the 60 L base fee'}</td></tr>)}</tbody></table></div><button className="button" disabled={busy || !areas.some(a => a.active)}>Save 60 L base fee</button></form>
     </section>
-    <section className="panel settings-panel"><h2>Waste fees by area and bin size</h2><p className="muted">These tariffs are for the tagged household bins in the new property workflow. Existing address-based fees and historical payments remain unchanged.</p>
-      <form className="form-grid" onSubmit={saveBinFee}><label className="field"><span>Service area</span><select name="area_id" required defaultValue=""><option value="" disabled>Choose area</option>{areas.filter(a => a.active).map(a => <option key={a.id} value={a.id}>{areaLabel(a)}</option>)}</select></label><label className="field"><span>Bin capacity (litres)</span><input name="size_litres" type="number" min="1" step="1" required/></label><label className="field"><span>Fee (NGN)</span><input name="amount_naira" type="number" min="0" step="0.01" required/></label><button className="button" disabled={busy || !areas.some(a => a.active)}>Save bin fee</button></form>
-      {binFees.length === 0 ? <p className="empty-inline">No area and bin-size tariffs configured yet.</p> : <div className="table-wrap"><table><thead><tr><th>Service area</th><th>Bin size</th><th>Amount</th><th>Updated</th></tr></thead><tbody>{binFees.map(f => <tr key={f.id}><td>{f.area}</td><td>{f.size_litres} L</td><td>{money(f.amount_kobo)}</td><td>{new Date(f.updated_at).toLocaleString()}</td></tr>)}</tbody></table></div>}
-    </section>
-    <section className="panel"><h2>Fee records</h2>{fees.length === 0 ? <p className="empty-inline">No area fees have been configured.</p> : <div className="table-wrap"><table><thead><tr><th>Area</th><th>Fee</th><th>Last updated</th></tr></thead><tbody>{fees.map(f => <tr key={f.id}><td>{f.resolved ? `${f.locality}, ${f.city}, ${f.state}` : <><strong>{f.area_name}</strong><p className="form-error">Unresolved legacy fee. Confirm its city and state before assigning.</p><select aria-label={`Assign legacy fee ${f.area_name} to service area`} value={legacyArea[f.id] || ''} onChange={e => setLegacyArea({ ...legacyArea, [f.id]: e.target.value })}><option value="">Choose area</option>{areas.filter(a => a.active).map(a => <option key={a.id} value={a.id}>{areaLabel(a)}</option>)}</select><button className="link-button" disabled={busy || !legacyArea[f.id]} onClick={() => reconcile(f)}>Assign without changing fee</button></>}</td><td>{money(f.amount_kobo)}</td><td>{new Date(f.updated_at).toLocaleString()}</td></tr>)}</tbody></table></div>}</section>
+    <section className="panel"><h2>Fee records</h2>{fees.length === 0 ? <p className="empty-inline">No area fees have been configured.</p> : <div className="table-wrap"><table><thead><tr><th>Area</th><th>60 L base fee</th><th>Last updated</th></tr></thead><tbody>{fees.map(f => <tr key={f.id}><td>{f.resolved ? `${f.locality}, ${f.city}, ${f.state}` : <><strong>{f.area_name}</strong><p className="form-error">Unresolved legacy fee. Confirm its city and state before assigning.</p><select aria-label={`Assign legacy fee ${f.area_name} to service area`} value={legacyArea[f.id] || ''} onChange={e => setLegacyArea({ ...legacyArea, [f.id]: e.target.value })}><option value="">Choose area</option>{areas.filter(a => a.active).map(a => <option key={a.id} value={a.id}>{areaLabel(a)}</option>)}</select><button className="link-button" disabled={busy || !legacyArea[f.id]} onClick={() => reconcile(f)}>Assign without changing fee</button></>}</td><td>{money(f.amount_kobo)}</td><td>{new Date(f.updated_at).toLocaleString()}</td></tr>)}</tbody></table></div>}</section>
     {error && <p className="form-error" role="alert">{error}</p>}{message && <p className="success-message">{message}</p>}
   </>
 }
