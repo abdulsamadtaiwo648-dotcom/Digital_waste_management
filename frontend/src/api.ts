@@ -39,11 +39,14 @@ if (appRole !== 'resident' && appRole !== 'management' && appRole !== 'admin') {
   throw new Error(`VITE_APP_ROLE must be resident, management, or admin (got "${appRole}")`)
 }
 const configuredRoot = configuredAPI?.replace(/\/+$/, '')
-const API = configuredRoot
-  ? configuredRoot.endsWith('/api/v1') ? configuredRoot : `${configuredRoot}/api/v1`
-  : import.meta.env.DEV
-    ? localAPI
-    : ''
+const renderResidentProxy = appRole === 'resident' && window.location.hostname.endsWith('.onrender.com')
+const API = renderResidentProxy
+  ? '/api/v1'
+  : configuredRoot
+    ? configuredRoot.endsWith('/api/v1') ? configuredRoot : `${configuredRoot}/api/v1`
+    : import.meta.env.DEV
+      ? localAPI
+      : ''
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!API) throw new Error(`The ${appRole} API URL is not configured for this deployment`)
