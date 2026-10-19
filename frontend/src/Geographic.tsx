@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { api } from './api'
 import type { BinEvacuationEvent, ResidentLocation, ServiceArea } from './api'
-import { GoogleAddressPicker } from './GoogleAddressPicker'
 
 function areaLabel(area: ServiceArea) {
   return `${area.locality}, ${area.city}, ${area.state}`
@@ -61,7 +60,6 @@ export function ManagedLocationsPanel() {
   const [selectedArea, setSelectedArea] = useState('')
   const [addressLine1, setAddressLine1] = useState('')
   const [postalCode, setPostalCode] = useState('')
-  const [coordinates, setCoordinates] = useState<{ latitude: number; longitude: number } | null>(null)
 
   const load = async () => {
     const [locations, serviceAreas] = await Promise.all([api.locations(), api.serviceAreas()])
@@ -76,9 +74,9 @@ export function ManagedLocationsPanel() {
     const d = new FormData(form)
     setBusy(true); setError('')
     try {
-      await api.createLocation({ area_id: Number(d.get('area_id')), label: String(d.get('label')), address_line1: String(d.get('address_line1')), address_line2: String(d.get('address_line2')), postal_code: String(d.get('postal_code')), ...(coordinates ?? {}) })
+      await api.createLocation({ area_id: Number(d.get('area_id')), label: String(d.get('label')), address_line1: String(d.get('address_line1')), address_line2: String(d.get('address_line2')), postal_code: String(d.get('postal_code')) })
       form.reset()
-      setAddressLine1(''); setPostalCode(''); setCoordinates(null)
+      setAddressLine1(''); setPostalCode('')
       await load()
     } catch (e) { setError(e instanceof Error ? e.message : 'Address could not be saved') }
     finally { setBusy(false) }
@@ -108,13 +106,12 @@ export function ManagedLocationsPanel() {
     <section className="panel form-panel">
       <h2>Add a home or business</h2>
       <form className="form-grid" onSubmit={submit}>
-        <div className="address-map-field"><GoogleAddressPicker onAddress={result => { setAddressLine1(result.addressLine1); setPostalCode(result.postalCode); setCoordinates({ latitude: result.latitude, longitude: result.longitude }) }}/></div>
         <label className="field"><span>Property label</span><input name="label" placeholder="Home, Shop, Workshop" required maxLength={80}/></label>
         <label className="field"><span>Street address</span><input name="address_line1" autoComplete="address-line1" required maxLength={180} value={addressLine1} onChange={e => setAddressLine1(e.target.value)}/></label>
         <label className="field"><span>Apartment or suite (optional)</span><input name="address_line2" autoComplete="address-line2" maxLength={180}/></label>
         <label className="field"><span>Service area</span><select name="area_id" required defaultValue=""><option value="" disabled>{areas.length ? 'Choose locality, city and state' : 'No active service areas available'}</option>{areas.map(a => <option key={a.id} value={a.id}>{areaLabel(a)}</option>)}</select></label>
         <label className="field"><span>Postal code (optional)</span><input name="postal_code" autoComplete="postal-code" maxLength={24} value={postalCode} onChange={e => setPostalCode(e.target.value)}/></label>
-        <p className="muted form-hint">Review the suggested street address, then choose the correct managed service area. The map does not determine service-area boundaries.</p>
+        <p className="muted form-hint">Enter the street address, then choose the correct managed service area. The service area determines which fee applies.</p>
         {error && <p className="form-error" role="alert">{error}</p>}
         <button className="button" disabled={busy || areas.length === 0}>{busy ? 'Saving…' : 'Save address'}</button>
       </form>
