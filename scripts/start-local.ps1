@@ -83,6 +83,8 @@ if (-not $UseNeon) {
     if ($LASTEXITCODE -ne 0) { throw 'Migration 012 failed. Resolve any duplicate unit codes, then rerun.' }
     & $psql -v ON_ERROR_STOP=1 -f (Join-Path $root 'db\migrations\013_bin_account_and_evacuation.sql') $env:DATABASE_URL
     if ($LASTEXITCODE -ne 0) { throw 'Migration 013 failed.' }
+    & $psql -v ON_ERROR_STOP=1 -f (Join-Path $root 'db\migrations\014_monthly_service_invoices.sql') $env:DATABASE_URL
+    if ($LASTEXITCODE -ne 0) { throw 'Migration 014 failed.' }
 } else {
     Write-Output 'Using the Neon DATABASE_URL from .env.local; migrations are not run by this startup mode.'
 }

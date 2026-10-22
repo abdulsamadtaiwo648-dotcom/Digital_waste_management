@@ -4,14 +4,22 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
-// assistedPropertyRegistration lets authorized field staff enter a property
-// registration for an existing resident account. It never creates credentials.
+// assistedPropertyRegistration lets authorized field staff help a resident
+// create an account and register a property, or register a property for an
+// existing resident. New account credentials are entered by the resident.
 func (s *server) assistedPropertyRegistration(w http.ResponseWriter, r *http.Request) {
 	current := r.Context().Value(userContextKey).(user)
 	var in struct {
 		ResidentEmail string              `json:"resident_email"`
+		CreateAccount bool                `json:"create_account"`
+		ResidentName  string              `json:"resident_name"`
+		ResidentPhone string              `json:"resident_phone"`
+		Password      string              `json:"password"`
+		TermsAccepted bool                `json:"terms_accepted"`
 		AreaID        int64               `json:"area_id"`
 		Label         string              `json:"label"`
 		AddressLine1  string              `json:"address_line1"`
@@ -28,13 +36,28 @@ func (s *server) assistedPropertyRegistration(w http.ResponseWriter, r *http.Req
 		return
 	}
 	in.ResidentEmail = strings.TrimSpace(strings.ToLower(in.ResidentEmail))
+	in.ResidentName = strings.TrimSpace(in.ResidentName)
+	in.ResidentPhone = strings.TrimSpace(in.ResidentPhone)
 	in.Label = strings.TrimSpace(in.Label)
 	in.AddressLine1 = strings.TrimSpace(in.AddressLine1)
 	in.AddressLine2 = strings.TrimSpace(in.AddressLine2)
 	in.PostalCode = strings.TrimSpace(in.PostalCode)
-	if !strings.Contains(in.ResidentEmail, "@") || in.AreaID < 1 || len(in.Label) < 1 || len(in.Label) > 80 || len(in.AddressLine1) < 1 || len(in.AddressLine1) > 180 || len(in.AddressLine2) > 180 || len(in.PostalCode) > 24 || !oneOf(in.Type, "residential", "commercial", "mixed_use", "other") || !oneOf(in.Structure, "bungalow", "storey_building", "apartment_block", "shop_complex", "mixed_use", "other") || in.Floors < 1 || in.Floors > 100 || !oneOf(in.Scope, "whole_property", "single_unit") || !oneOf(in.Role, "owner", "tenant", "caretaker", "agent") || len(in.Units) == 0 || len(in.Units) > 100 || (in.Scope == "single_unit" && len(in.Units) != 1) {
+	if !validEmail(in.ResidentEmail) || in.AreaID < 1 || len(in.Label) < 1 || len(in.Label) > 80 || len(in.AddressLine1) < 1 || len(in.AddressLine1) > 180 || len(in.AddressLine2) > 180 || len(in.PostalCode) > 24 || !oneOf(in.Type, "residential", "commercial", "mixed_use", "other") || !oneOf(in.Structure, "bungalow", "storey_building", "apartment_block", "shop_complex", "mixed_use", "other") || in.Floors < 1 || in.Floors > 100 || !oneOf(in.Scope, "whole_property", "single_unit") || !oneOf(in.Role, "owner", "tenant", "caretaker", "agent") || len(in.Units) == 0 || len(in.Units) > 100 || (in.Scope == "single_unit" && len(in.Units) != 1) {
 		writeError(w, 422, "invalid_assisted_registration", "Enter an existing resident email, active service area, valid address and property details")
 		return
+	}
+	var passwordHash string
+	if in.CreateAccount {
+		if len(in.ResidentName) < 2 || len(in.ResidentName) > 120 || len(in.ResidentPhone) < 7 || len(in.ResidentPhone) > 32 || len(in.Password) < 12 || !in.TermsAccepted {
+			writeError(w, 422, "invalid_resident_account", "The resident must provide their name, phone number, a password of at least 12 characters, and accept the terms")
+			return
+		}
+		var err error
+		passwordHash, err = hashPassword(in.Password)
+		if err != nil {
+			writeError(w, 500, "account_creation_failed", "Resident account could not be created")
+			return
+		}
 	}
 	expectedBins := 0
 	hasShared := false
@@ -68,10 +91,29 @@ func (s *server) assistedPropertyRegistration(w http.ResponseWriter, r *http.Req
 	}
 	defer tx.Rollback(r.Context())
 	var residentID int64
-	err = tx.QueryRow(r.Context(), `SELECT id FROM users WHERE lower(email)=$1 AND role='citizen' AND deleted_at IS NULL FOR SHARE`, in.ResidentEmail).Scan(&residentID)
-	if err != nil {
-		writeError(w, 404, "resident_not_found", "No active resident account matches that email. Confirm the account with the resident before continuing.")
-		return
+	accountCreated := false
+	if in.CreateAccount {
+		err = tx.QueryRow(r.Context(), `INSERT INTO users(full_name,email,phone,password_hash,role,terms_accepted_at)
+			VALUES($1,$2,$3,$4,'citizen',now()) RETURNING id`, in.ResidentName, in.ResidentEmail, in.ResidentPhone, passwordHash).Scan(&residentID)
+		if err != nil {
+			if strings.Contains(strings.ToLower(err.Error()), "unique") {
+				writeError(w, http.StatusConflict, "email_in_use", "An account with this email already exists. Choose existing resident account or confirm the email with the resident.")
+				return
+			}
+			writeError(w, 500, "account_creation_failed", "Resident account could not be created")
+			return
+		}
+		accountCreated = true
+	} else {
+		err = tx.QueryRow(r.Context(), `SELECT id FROM users WHERE lower(email)=$1 AND role='citizen' AND deleted_at IS NULL FOR SHARE`, in.ResidentEmail).Scan(&residentID)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				writeError(w, 404, "resident_not_found", "No active resident account matches that email. Confirm the account with the resident before continuing.")
+				return
+			}
+			writeError(w, 500, "assisted_registration_failed", "Resident account could not be checked")
+			return
+		}
 	}
 	var locationID int64
 	err = tx.QueryRow(r.Context(), `INSERT INTO resident_locations(resident_id,area_id,label,address_line1,address_line2,locality,city,state,postal_code)
@@ -98,9 +140,9 @@ func (s *server) assistedPropertyRegistration(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
-	if err = s.commitAudit(r.Context(), tx, current.ID, "assisted_property_registration_created", "registered_property", strconv.FormatInt(propertyID, 10), map[string]any{"resident_id": residentID, "area_id": in.AreaID, "unit_count": len(in.Units), "registrant_role": in.Role}); err != nil {
+	if err = s.commitAudit(r.Context(), tx, current.ID, "assisted_property_registration_created", "registered_property", strconv.FormatInt(propertyID, 10), map[string]any{"resident_id": residentID, "resident_account_created": accountCreated, "area_id": in.AreaID, "unit_count": len(in.Units), "registrant_role": in.Role}); err != nil {
 		writeError(w, 500, "assisted_registration_failed", "Registration and audit record could not be saved")
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]int64{"id": propertyID})
+	writeJSON(w, http.StatusCreated, map[string]any{"id": propertyID, "account_created": accountCreated})
 }

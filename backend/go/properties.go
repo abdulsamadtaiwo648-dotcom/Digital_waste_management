@@ -75,6 +75,18 @@ type registeredPropertyView struct {
 	Bins           []propertyBinView  `json:"bins"`
 }
 
+func queryInt(r *http.Request, key string, fallback, minValue, maxValue int) int {
+	value := strings.TrimSpace(r.URL.Query().Get(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < minValue || parsed > maxValue {
+		return fallback
+	}
+	return parsed
+}
+
 func (s *server) registerProperty(w http.ResponseWriter, r *http.Request) {
 	current := r.Context().Value(userContextKey).(user)
 	var in struct {
@@ -300,17 +312,74 @@ func (s *server) residentBinEvacuationHistory(w http.ResponseWriter, r *http.Req
 }
 
 func (s *server) operationsProperties(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(r.Context(), `SELECT p.id,p.status,p.review_status,COALESCE(p.review_reason,''),p.property_type,p.structure_type,p.registration_scope,p.registrant_role,l.label,l.address_line1,l.address_line2,a.locality,a.city,a.state,actor.full_name,actor.phone,unit.id,unit.unit_code,unit.service_scope
-		FROM registered_properties p JOIN resident_locations l ON l.id=p.location_id JOIN service_areas a ON a.id=l.area_id
-		LEFT JOIN LATERAL (SELECT m.user_id FROM property_account_memberships m WHERE m.property_id=p.id AND m.ended_at IS NULL AND m.is_primary_contact ORDER BY m.created_at LIMIT 1) contact ON true
-		JOIN users actor ON actor.id=COALESCE(contact.user_id,p.registered_by) LEFT JOIN property_units unit ON unit.property_id=p.id
-		WHERE p.status<>'inactive' ORDER BY p.created_at,unit.id LIMIT 1000`)
+	page := queryInt(r, "page", 1, 1, 1000000)
+	pageSize := queryInt(r, "page_size", 25, 1, 100)
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	if status != "" && !oneOf(status, "pending_review", "awaiting_bin_delivery", "verified", "rejected") {
+		writeError(w, http.StatusBadRequest, "invalid_filter", "Choose a valid application status")
+		return
+	}
+	search := strings.TrimSpace(r.URL.Query().Get("search"))
+	if len(search) > 120 {
+		search = search[:120]
+	}
+	contactJoin := `LEFT JOIN LATERAL (SELECT m.user_id FROM property_account_memberships m WHERE m.property_id=p.id AND m.ended_at IS NULL AND m.is_primary_contact ORDER BY m.created_at LIMIT 1) contact ON true
+		JOIN users actor ON actor.id=COALESCE(contact.user_id,p.registered_by)`
+	filter := `p.status<>'inactive' AND ($1='' OR p.review_status=$1) AND ($2='' OR concat_ws(' ',actor.full_name,actor.email,actor.phone,l.label,l.address_line1,l.address_line2,a.locality,a.city,a.state) ILIKE '%'||$2||'%')`
+	var total int
+	err := s.db.QueryRow(r.Context(), `SELECT count(*) FROM registered_properties p JOIN resident_locations l ON l.id=p.location_id JOIN service_areas a ON a.id=l.area_id `+contactJoin+` WHERE `+filter, status, search).Scan(&total)
 	if err != nil {
 		writeError(w, 500, "properties_unavailable", "Property registrations could not be loaded")
 		return
 	}
-	defer rows.Close()
-	type item struct {
+	offset := (page - 1) * pageSize
+	rows, err := s.db.Query(r.Context(), `SELECT p.id,p.review_status,p.property_type,p.structure_type,p.registration_scope,actor.full_name,a.locality,a.city,a.state,p.created_at,
+		(SELECT count(*) FROM property_units u WHERE u.property_id=p.id),
+		(SELECT count(*) FROM property_bins b WHERE b.property_id=p.id)
+		FROM registered_properties p JOIN resident_locations l ON l.id=p.location_id JOIN service_areas a ON a.id=l.area_id `+contactJoin+`
+		WHERE `+filter+` ORDER BY CASE p.review_status WHEN 'pending_review' THEN 0 WHEN 'awaiting_bin_delivery' THEN 1 WHEN 'needs_review' THEN 2 WHEN 'verified' THEN 3 ELSE 4 END,p.created_at DESC,p.id DESC LIMIT $3 OFFSET $4`, status, search, pageSize, offset)
+	if err != nil {
+		writeError(w, 500, "properties_unavailable", "Property registrations could not be loaded")
+		return
+	}
+	type summary struct {
+		ID           int64     `json:"id"`
+		ReviewStatus string    `json:"review_status"`
+		PropertyType string    `json:"property_type"`
+		Structure    string    `json:"structure_type"`
+		Scope        string    `json:"registration_scope"`
+		Resident     string    `json:"resident"`
+		Area         string    `json:"area"`
+		CreatedAt    time.Time `json:"created_at"`
+		UnitCount    int       `json:"unit_count"`
+		BinCount     int       `json:"bin_count"`
+	}
+	items := make([]summary, 0, pageSize)
+	for rows.Next() {
+		var x summary
+		var locality, city, state string
+		if err := rows.Scan(&x.ID, &x.ReviewStatus, &x.PropertyType, &x.Structure, &x.Scope, &x.Resident, &locality, &city, &state, &x.CreatedAt, &x.UnitCount, &x.BinCount); err != nil {
+			writeError(w, 500, "properties_unavailable", "Property registrations could not be loaded")
+			return
+		}
+		x.Area = strings.Join([]string{locality, city, state}, ", ")
+		items = append(items, x)
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		writeError(w, 500, "properties_unavailable", "Property registrations could not be loaded")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"properties": items, "total": total, "page": page, "page_size": pageSize})
+}
+
+func (s *server) operationsPropertyDetails(w http.ResponseWriter, r *http.Request) {
+	propertyID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || propertyID < 1 {
+		writeError(w, http.StatusBadRequest, "invalid_property", "Property id is invalid")
+		return
+	}
+	var item struct {
 		ID           int64              `json:"id"`
 		Status       string             `json:"status"`
 		ReviewStatus string             `json:"review_status"`
@@ -321,61 +390,69 @@ func (s *server) operationsProperties(w http.ResponseWriter, r *http.Request) {
 		Role         string             `json:"registrant_role"`
 		Address      string             `json:"address"`
 		Resident     string             `json:"resident"`
+		Email        string             `json:"email"`
 		Phone        string             `json:"phone"`
 		Units        []propertyUnitView `json:"units"`
 		Bins         []propertyBinView  `json:"bins"`
 	}
-	items := make([]item, 0)
-	byID := map[int64]int{}
-	for rows.Next() {
-		var x item
-		var label, line1, line2, locality, city, state string
-		var unitID *int64
-		var unitCode *string
-		var unitService *string
-		if err := rows.Scan(&x.ID, &x.Status, &x.ReviewStatus, &x.ReviewReason, &x.PropertyType, &x.Structure, &x.Scope, &x.Role, &label, &line1, &line2, &locality, &city, &state, &x.Resident, &x.Phone, &unitID, &unitCode, &unitService); err != nil {
-			writeError(w, 500, "properties_unavailable", "Property registrations could not be loaded")
+	var label, line1, line2, locality, city, state string
+	err = s.db.QueryRow(r.Context(), `SELECT p.id,p.status,p.review_status,COALESCE(p.review_reason,''),p.property_type,p.structure_type,p.registration_scope,p.registrant_role,l.label,l.address_line1,l.address_line2,a.locality,a.city,a.state,actor.full_name,actor.email,actor.phone
+		FROM registered_properties p JOIN resident_locations l ON l.id=p.location_id JOIN service_areas a ON a.id=l.area_id
+		LEFT JOIN LATERAL (SELECT m.user_id FROM property_account_memberships m WHERE m.property_id=p.id AND m.ended_at IS NULL AND m.is_primary_contact ORDER BY m.created_at LIMIT 1) contact ON true
+		JOIN users actor ON actor.id=COALESCE(contact.user_id,p.registered_by)
+		WHERE p.id=$1 AND p.status<>'inactive'`, propertyID).Scan(&item.ID, &item.Status, &item.ReviewStatus, &item.ReviewReason, &item.PropertyType, &item.Structure, &item.Scope, &item.Role, &label, &line1, &line2, &locality, &city, &state, &item.Resident, &item.Email, &item.Phone)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "property_not_found", "Property application was not found")
 			return
 		}
-		x.Address = strings.Trim(strings.Join([]string{label, line1, line2, locality, city, state}, ", "), ", ")
-		idx, ok := byID[x.ID]
-		if !ok {
-			x.Units = []propertyUnitView{}
-			x.Bins = []propertyBinView{}
-			byID[x.ID] = len(items)
-			items = append(items, x)
-			idx = len(items) - 1
-		}
-		if unitID != nil && unitCode != nil && unitService != nil {
-			items[idx].Units = append(items[idx].Units, propertyUnitView{ID: *unitID, Code: *unitCode, Service: *unitService})
-		}
-	}
-	if rows.Err() != nil {
-		writeError(w, 500, "properties_unavailable", "Property registrations could not be loaded")
+		writeError(w, 500, "properties_unavailable", "Property application could not be loaded")
 		return
 	}
-	binRows, err := s.db.Query(r.Context(), `SELECT b.property_id,b.id,b.tracking_id,b.size_litres,b.status,COALESCE(u.unit_code,''),b.created_at,b.delivered_at,COALESCE(deliverer.full_name,''),COALESCE(event.note,''),COALESCE(assigned.full_name,'Unassigned'),evacuation.evacuated_at,COALESCE(evacuator.full_name,'') FROM property_bins b LEFT JOIN property_units u ON u.id=b.unit_id LEFT JOIN users deliverer ON deliverer.id=b.delivered_by LEFT JOIN users assigned ON assigned.id=b.assigned_resident_id LEFT JOIN LATERAL (SELECT note FROM bin_delivery_events WHERE bin_id=b.id ORDER BY created_at DESC,id DESC LIMIT 1) event ON true LEFT JOIN LATERAL (SELECT evacuated_at,staff_id FROM bin_evacuation_events WHERE bin_id=b.id ORDER BY evacuated_at DESC,id DESC LIMIT 1) evacuation ON true LEFT JOIN users evacuator ON evacuator.id=evacuation.staff_id JOIN registered_properties p ON p.id=b.property_id WHERE p.status<>'inactive' ORDER BY b.property_id,b.id`)
+	item.Address = strings.Trim(strings.Join([]string{label, line1, line2, locality, city, state}, ", "), ", ")
+	item.Units = make([]propertyUnitView, 0)
+	unitRows, err := s.db.Query(r.Context(), `SELECT id,unit_code,unit_type,floor_label,service_scope FROM property_units WHERE property_id=$1 ORDER BY id`, propertyID)
+	if err != nil {
+		writeError(w, 500, "properties_unavailable", "Property units could not be loaded")
+		return
+	}
+	for unitRows.Next() {
+		var u propertyUnitView
+		if err = unitRows.Scan(&u.ID, &u.Code, &u.UnitType, &u.FloorLabel, &u.Service); err != nil {
+			unitRows.Close()
+			writeError(w, 500, "properties_unavailable", "Property units could not be loaded")
+			return
+		}
+		item.Units = append(item.Units, u)
+	}
+	if err = unitRows.Err(); err != nil {
+		unitRows.Close()
+		writeError(w, 500, "properties_unavailable", "Property units could not be loaded")
+		return
+	}
+	unitRows.Close()
+	item.Bins = make([]propertyBinView, 0)
+	binRows, err := s.db.Query(r.Context(), `SELECT b.id,b.tracking_id,b.size_litres,b.status,COALESCE(u.unit_code,''),b.created_at,b.delivered_at,COALESCE(deliverer.full_name,''),COALESCE(event.note,''),COALESCE(assigned.full_name,'Unassigned'),evacuation.evacuated_at,COALESCE(evacuator.full_name,'') FROM property_bins b LEFT JOIN property_units u ON u.id=b.unit_id LEFT JOIN users deliverer ON deliverer.id=b.delivered_by LEFT JOIN users assigned ON assigned.id=b.assigned_resident_id LEFT JOIN LATERAL (SELECT note FROM bin_delivery_events WHERE bin_id=b.id ORDER BY created_at DESC,id DESC LIMIT 1) event ON true LEFT JOIN LATERAL (SELECT evacuated_at,staff_id FROM bin_evacuation_events WHERE bin_id=b.id ORDER BY evacuated_at DESC,id DESC LIMIT 1) evacuation ON true LEFT JOIN users evacuator ON evacuator.id=evacuation.staff_id WHERE b.property_id=$1 ORDER BY b.id`, propertyID)
 	if err != nil {
 		writeError(w, 500, "properties_unavailable", "Property bin records could not be loaded")
 		return
 	}
-	defer binRows.Close()
 	for binRows.Next() {
-		var propertyID int64
 		var bin propertyBinView
-		if err := binRows.Scan(&propertyID, &bin.ID, &bin.TrackingID, &bin.Size, &bin.Status, &bin.UnitCode, &bin.RegisteredAt, &bin.DeliveredAt, &bin.DeliveredBy, &bin.DeliveryNote, &bin.AssignedResident, &bin.LastEvacuatedAt, &bin.EvacuatedBy); err != nil {
+		if err := binRows.Scan(&bin.ID, &bin.TrackingID, &bin.Size, &bin.Status, &bin.UnitCode, &bin.RegisteredAt, &bin.DeliveredAt, &bin.DeliveredBy, &bin.DeliveryNote, &bin.AssignedResident, &bin.LastEvacuatedAt, &bin.EvacuatedBy); err != nil {
+			binRows.Close()
 			writeError(w, 500, "properties_unavailable", "Property bin records could not be loaded")
 			return
 		}
-		if idx, ok := byID[propertyID]; ok {
-			items[idx].Bins = append(items[idx].Bins, bin)
-		}
+		item.Bins = append(item.Bins, bin)
 	}
 	if binRows.Err() != nil {
+		binRows.Close()
 		writeError(w, 500, "properties_unavailable", "Property bin records could not be loaded")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"properties": items})
+	binRows.Close()
+	writeJSON(w, http.StatusOK, map[string]any{"property": item})
 }
 
 func (s *server) createPropertyBin(w http.ResponseWriter, r *http.Request) {

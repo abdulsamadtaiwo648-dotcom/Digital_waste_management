@@ -124,6 +124,7 @@ func main() {
 	mux.Handle("POST /api/v1/properties/unit-requests", s.requireUser(http.HandlerFunc(s.requestPropertyUnit)))
 	mux.Handle("GET /api/v1/properties/unit-requests", s.requireUser(http.HandlerFunc(s.residentPropertyUnitRequests)))
 	mux.Handle("GET /api/v1/payments/options", s.requireUser(http.HandlerFunc(s.paymentOptions)))
+	mux.Handle("GET /api/v1/monthly-invoices", s.requireUser(http.HandlerFunc(s.residentMonthlyInvoices)))
 	mux.Handle("GET /api/v1/payments", s.requireUser(http.HandlerFunc(s.listPayments)))
 	mux.Handle("POST /api/v1/payments", s.requireUser(s.limitAuth(http.HandlerFunc(s.createPayment))))
 	mux.Handle("GET /api/v1/payments/{reference}", s.requireUser(http.HandlerFunc(s.getPayment)))
@@ -138,6 +139,7 @@ func main() {
 	mux.Handle("PATCH /api/v1/operations/complaints/{reference}", s.requireRole("operations_manager", http.HandlerFunc(s.updateComplaintStatus)))
 	mux.Handle("GET /api/v1/operations/containers", s.requireRole("operations_manager", http.HandlerFunc(s.listContainers)))
 	mux.Handle("GET /api/v1/operations/properties", s.requireRole("operations_manager", http.HandlerFunc(s.operationsProperties)))
+	mux.Handle("GET /api/v1/operations/properties/{id}", s.requireRole("operations_manager", http.HandlerFunc(s.operationsPropertyDetails)))
 	mux.Handle("PATCH /api/v1/operations/properties/{id}/review", s.requireRole("operations_manager", http.HandlerFunc(s.reviewPropertyRegistration)))
 	mux.Handle("GET /api/v1/operations/service-areas", s.requireRole("operations_manager", http.HandlerFunc(s.listOperationsServiceAreas)))
 	mux.Handle("POST /api/v1/operations/assisted-properties", s.requireRole("operations_manager", http.HandlerFunc(s.assistedPropertyRegistration)))
@@ -179,6 +181,9 @@ func main() {
 	mux.Handle("POST /api/v1/admin/service-areas", s.requireRole("system_administrator", http.HandlerFunc(s.createServiceArea)))
 	mux.Handle("PATCH /api/v1/admin/service-areas/{id}", s.requireRole("system_administrator", http.HandlerFunc(s.updateServiceArea)))
 	addr := ":" + envOr("PORT", servicePort(serviceRole))
+	if serviceRole == "resident" {
+		s.startMonthlyBilling(logger)
+	}
 	logger.Info("Go API listening", "address", addr)
 	apiServer := &http.Server{
 		Addr:              addr,
