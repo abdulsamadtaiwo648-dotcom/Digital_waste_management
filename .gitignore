@@ -7,3 +7,5 @@ __pycache__/
 *.py[cod]
 bin/
 coverage.out
+sensor/simulator/sensor_log.jsonl
+*.jsonl

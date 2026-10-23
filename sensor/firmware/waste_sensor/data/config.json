@@ -1,0 +1,17 @@
+{
+  "device_id": "sensor-001",
+  "device_token": "your-secure-token-here",
+  "bin_depth_cm": 100.0,
+  "min_distance_cm": 2.0,
+  "warning_threshold": 70,
+  "critical_threshold": 90,
+  "read_interval_minutes": 15,
+  "api_endpoint": "http://your-server:8082/api/v1/iot/readings",
+  "registered_lat": 6.5244,
+  "registered_lng": 3.3792,
+  "wifi_ssid": "YourWiFiNetwork",
+  "wifi_password": "YourWiFiPassword",
+  "registered_bssid": "AA:BB:CC:DD:EE:FF",
+  "registered_rssi": -55,
+  "gsm_apn": "internet"
+}

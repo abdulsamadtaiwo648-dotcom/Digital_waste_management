@@ -60,4 +60,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     bind_host = os.getenv("PROCESSOR_BIND_HOST", "127.0.0.1")
-    ThreadingHTTPServer((bind_host, int(os.getenv("PORT", "8090"))), Handler).serve_forever()
+    port = int(os.getenv("PORT", "8090"))
+    print(f"[*] Python IoT Processor listening on http://{bind_host}:{port} (Ready)", flush=True)
+    ThreadingHTTPServer((bind_host, port), Handler).serve_forever()
